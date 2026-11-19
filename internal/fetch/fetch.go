@@ -2,6 +2,7 @@
 package fetch
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -16,6 +17,16 @@ import (
 type Result struct {
 	Path   string
 	Reused bool
+}
+
+func ConfirmReuse(path string, in io.Reader, out io.Writer) (bool, error) {
+	fmt.Fprintf(out, "Cached source %s exists. Reuse it? [Y/n] ", path)
+	answer, err := bufio.NewReader(in).ReadString('\n')
+	if err != nil && err != io.EOF {
+		return false, fmt.Errorf("read cache reuse response: %w", err)
+	}
+	answer = strings.TrimSpace(strings.ToLower(answer))
+	return answer == "" || answer == "y" || answer == "yes", nil
 }
 
 func VerifySHA256(path, expected string) (bool, error) {

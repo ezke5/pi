@@ -24,3 +24,11 @@ build and install testing.
 
 Global INI configuration is loaded from `pi.ini`, `.pi.ini`, or
 `~/.config/pi/config.ini`. CLI flags override INI values.
+
+`pi build` exports the recipe metadata variables (`pkgname`, `pkgver`,
+`pkgrel`, `srcdir`, and `pkgdir`) to `build()` and `package()`, clears
+`CONFIG_SITE`, and extracts standard source archives into `srcdir` while
+retaining the staged archive. Use `--reuse` to accept cached sources; when
+re-download mode is requested interactively, `pi` asks before replacing an
+existing cached source. `pi install <name>` resolves the highest-version
+matching package archive from the configured cache.

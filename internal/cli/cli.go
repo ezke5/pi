@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -207,20 +208,33 @@ func cmdBuild(c config.Config, args []string, reuse bool, dryRun *bool, stdout i
 
 	for i, source := range r.Source {
 		rawURL := source
+		sourceName := ""
 		if strings.Contains(source, "::") {
-			rawURL = strings.SplitN(source, "::", 2)[1]
+			parts := strings.SplitN(source, "::", 2)
+			sourceName, rawURL = parts[0], parts[1]
 		}
 		var local string
 		if strings.Contains(rawURL, "://") {
 			base := filepath.Base(strings.SplitN(rawURL, "?", 2)[0])
+			if sourceName == "" {
+				sourceName = base
+			}
 			local = filepath.Join(c.Cache, base)
-			if info, statErr := os.Stat(local); statErr == nil && !info.IsDir() && reuse {
-				fmt.Fprintf(stdout, "reusing cached source %s\n", local)
-			} else if statErr == nil && !info.IsDir() && !reuse {
-				if err := os.Remove(local); err != nil {
-					return fmt.Errorf("remove cached source %q: %w", local, err)
+			if info, statErr := os.Stat(local); statErr == nil && !info.IsDir() {
+				shouldReuse := reuse
+				if !reuse {
+					if fileInfo, infoErr := os.Stdin.Stat(); infoErr == nil && fileInfo.Mode()&os.ModeCharDevice != 0 {
+						shouldReuse, infoErr = fetch.ConfirmReuse(local, os.Stdin, stdout)
+						if infoErr != nil {
+							return infoErr
+						}
+					}
 				}
-				if err := fetch.Download(rawURL, local, 30*time.Second); err != nil {
+				if shouldReuse {
+					fmt.Fprintf(stdout, "reusing cached source %s\n", local)
+				} else if err := os.Remove(local); err != nil {
+					return fmt.Errorf("remove cached source %q: %w", local, err)
+				} else if err := fetch.Download(rawURL, local, 30*time.Second); err != nil {
 					return fmt.Errorf("%s", fetch.ManualDownloadNotice(err))
 				}
 			} else {
@@ -232,6 +246,9 @@ func cmdBuild(c config.Config, args []string, reuse bool, dryRun *bool, stdout i
 			local = source
 			if !filepath.IsAbs(local) {
 				local = filepath.Join(filepath.Dir(r.Path), local)
+			}
+			if sourceName == "" {
+				sourceName = filepath.Base(local)
 			}
 		}
 		if info, err := os.Stat(local); err != nil || info.IsDir() {
@@ -246,15 +263,18 @@ func cmdBuild(c config.Config, args []string, reuse bool, dryRun *bool, stdout i
 			}
 		}
 		// Copy source archives into srcdir for build().
-		dest := filepath.Join(srcDir, filepath.Base(local))
+		dest := filepath.Join(srcDir, sourceName)
 		if err := copyFile(local, dest); err != nil {
 			return fmt.Errorf("stage source %q in %q: %w", local, srcDir, err)
 		}
+		if isSourceArchive(dest) && !contains(r.Noextract, sourceName) {
+			if err := extractSourceArchive(dest, srcDir); err != nil {
+				return err
+			}
+		}
 	}
 
-	script := fmt.Sprintf("set -e\ncd %q\nSRC=%q\nPKGDIR=%q\n%s\nbuild\npackage\n", srcDir, srcDir, pkgDir, r.BuildFunction+"\n"+r.PackageFunction)
-	_ = script
-	cmdScript := "#!/bin/bash\nset -e\n" + fmt.Sprintf("export srcdir=%q\nexport pkgdir=%q\n", srcDir, pkgDir)
+	cmdScript := "#!/bin/bash\nset -e\n" + fmt.Sprintf("unset CONFIG_SITE\nexport pkgname=%q\nexport pkgver=%q\nexport pkgrel=%q\nexport srcdir=%q\nexport pkgdir=%q\n", r.Pkgname, r.Pkgver, r.Pkgrel, srcDir, pkgDir)
 	cmdScript += "cd \"$srcdir\"\n"
 	if r.BuildFunction != "" {
 		cmdScript += "build() {\n" + r.BuildFunction + "\n}\n"
@@ -318,22 +338,37 @@ func cmdInstall(c config.Config, args []string, allowHost bool, dryRun *bool, st
 		return err
 	}
 	archivePath := args[0]
-	if !strings.HasSuffix(archivePath, ".pkg.tar.zst") {
-		path, findErr := pkgbuild.Find(c.Ports, archivePath)
-		if findErr != nil {
+	if info, statErr := os.Stat(archivePath); statErr != nil || info.IsDir() {
+		if strings.HasSuffix(archivePath, ".pkg.tar.zst") {
 			archivePath = filepath.Join(c.Binpkgs, archivePath)
 		} else {
-			r, readErr := pkgbuild.Read(path)
-			if readErr != nil {
-				return readErr
+			path, findErr := pkgbuild.Find(c.Ports, archivePath)
+			if findErr == nil {
+				r, readErr := pkgbuild.Read(path)
+				if readErr != nil {
+					return readErr
+				}
+				exact := filepath.Join(c.Binpkgs, r.ArchiveName())
+				if _, exactErr := os.Stat(exact); exactErr == nil {
+					archivePath = exact
+				} else {
+					archivePath = findPackageArchive(c.Binpkgs, r.Pkgname)
+				}
+			} else {
+				archivePath = findPackageArchive(c.Binpkgs, archivePath)
 			}
-			archivePath = filepath.Join(c.Binpkgs, r.ArchiveName())
 		}
+	} else if !strings.HasSuffix(archivePath, ".pkg.tar.zst") {
+		archivePath = filepath.Join(c.Binpkgs, archivePath)
+	}
+	if archivePath == "" {
+		return fmt.Errorf("package archive for %q not found in cache %q", args[0], c.Binpkgs)
 	}
 	if _, err := os.Stat(archivePath); err != nil {
 		if os.IsNotExist(err) {
 			return fmt.Errorf("package archive %q not found; build it first or place it in cache %q", archivePath, c.Binpkgs)
 		}
+
 		return fmt.Errorf("inspect package archive %q: %w", archivePath, err)
 	}
 	if *dryRun {
@@ -345,6 +380,60 @@ func cmdInstall(c config.Config, args []string, allowHost bool, dryRun *bool, st
 	}
 	fmt.Fprintf(stdout, "installed %s into %s\n", archivePath, target)
 	return nil
+}
+
+func contains(values []string, value string) bool {
+	for _, item := range values {
+		if item == value {
+			return true
+		}
+	}
+	return false
+}
+
+func findPackageArchive(dir, name string) string {
+	matches, _ := filepath.Glob(filepath.Join(dir, name+"-*.pkg.tar.zst"))
+	if len(matches) == 0 {
+		return ""
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		return comparePackageVersions(packageVersion(filepath.Base(matches[i]), name), packageVersion(filepath.Base(matches[j]), name)) < 0
+	})
+	return matches[len(matches)-1]
+}
+
+func packageVersion(filename, name string) string {
+	prefix := name + "-"
+	return strings.TrimSuffix(strings.TrimPrefix(filename, prefix), ".pkg.tar.zst")
+}
+
+func comparePackageVersions(a, b string) int {
+	pa, pb := strings.Split(a, "-"), strings.Split(b, "-")
+	for i := 0; i < len(pa) && i < len(pb); i++ {
+		if pa[i] == pb[i] {
+			continue
+		}
+		var ai, bi int
+		if _, err := fmt.Sscanf(pa[i], "%d", &ai); err == nil {
+			if _, err := fmt.Sscanf(pb[i], "%d", &bi); err == nil && ai != bi {
+				if ai < bi {
+					return -1
+				}
+				return 1
+			}
+		}
+		if pa[i] < pb[i] {
+			return -1
+		}
+		return 1
+	}
+	if len(pa) < len(pb) {
+		return -1
+	}
+	if len(pa) > len(pb) {
+		return 1
+	}
+	return 0
 }
 
 func cmdRemove(c config.Config, args []string, allowHost bool, dryRun *bool, stdout io.Writer) error {
