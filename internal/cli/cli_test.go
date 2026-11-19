@@ -63,3 +63,38 @@ package() {
 		t.Fatalf("source was not extracted: %v", err)
 	}
 }
+
+func TestDryRunInstallResolvesDependenciesWithoutCreatingDirectories(t *testing.T) {
+	root := t.TempDir()
+	ports := filepath.Join(root, "ports")
+	work := filepath.Join(root, "work")
+	cache := filepath.Join(root, "cache")
+	target := filepath.Join(root, "target")
+	for _, name := range []string{"base", "app"} {
+		dir := filepath.Join(ports, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		depends := ""
+		if name == "app" {
+			depends = "depends=(base)\n"
+		}
+		content := "pkgname=" + name + "\npkgver=1\npkgrel=1\n" + depends
+		if err := os.WriteFile(filepath.Join(dir, "PKGBUILD"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var output bytes.Buffer
+	if err := Run([]string{"--ports", ports, "--work", work, "--cache", cache, "--root", target, "--dry-run", "install", "app"}, &output, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "1. base-1-1") || !strings.Contains(output.String(), "2. app-1-1") {
+		t.Fatalf("unexpected plan: %s", output.String())
+	}
+	if _, err := os.Stat(work); !os.IsNotExist(err) {
+		t.Fatalf("dry-run created work directory: %v", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("dry-run created target root: %v", err)
+	}
+}

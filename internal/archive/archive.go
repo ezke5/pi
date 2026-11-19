@@ -138,6 +138,7 @@ func Extract(output string, archivePath, destRoot string) error {
 	if _, err := os.Stat(archivePath); err != nil {
 		return fmt.Errorf("open package archive %q: %w", archivePath, err)
 	}
+
 	temp, err := os.CreateTemp(filepath.Dir(archivePath), ".pi-extract-*.tar")
 	if err != nil {
 		return fmt.Errorf("create temporary tar for package extraction: %w", err)
@@ -219,4 +220,51 @@ func Extract(output string, archivePath, destRoot string) error {
 	}
 	_ = output
 	return nil
+}
+
+// Entries returns the filesystem entries recorded in an archive without
+// writing them to the target root.
+func Entries(archivePath string) ([]footprint.Entry, error) {
+	temp, err := os.CreateTemp(filepath.Dir(archivePath), ".pi-inspect-*.tar")
+	if err != nil {
+		return nil, err
+	}
+	tempName := temp.Name()
+	if err := temp.Close(); err != nil {
+		return nil, err
+	}
+	defer os.Remove(tempName)
+	if out, err := exec.Command("zstd", "-q", "-d", "-f", "-o", tempName, archivePath).CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("decompress package archive %q: %w (%s)", archivePath, err, strings.TrimSpace(string(out)))
+	}
+	f, err := os.Open(tempName)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	tr := tar.NewReader(f)
+	var entries []footprint.Entry
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return entries, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		name := filepath.ToSlash(filepath.Clean(hdr.Name))
+		if name == ".PKGINFO" || name == "." || name == "" || strings.HasPrefix(name, "var/lib/pi/packages/") {
+			continue
+		}
+		entry := footprint.Entry{Path: "/" + strings.TrimPrefix(name, "/"), Mode: os.FileMode(hdr.Mode)}
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			entry.Type = "dir"
+		case tar.TypeSymlink:
+			entry.Type, entry.LinkTarget = "symlink", hdr.Linkname
+		default:
+			entry.Type = "file"
+		}
+		entries = append(entries, entry)
+	}
 }
