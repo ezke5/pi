@@ -19,6 +19,7 @@ type Recipe struct {
 	Source          []string
 	SHA256Sums      []string
 	Depends         []string
+	MakeDepends     []string
 	Noextract       []string
 	Backup          []string
 	BuildFunction   string
@@ -169,6 +170,8 @@ func setArray(recipe *Recipe, name, value string) {
 		recipe.SHA256Sums = splitShellWords(value)
 	case "depends":
 		recipe.Depends = splitShellWords(value)
+	case "makedepends":
+		recipe.MakeDepends = splitShellWords(value)
 	case "noextract":
 		recipe.Noextract = splitShellWords(value)
 	case "backup":

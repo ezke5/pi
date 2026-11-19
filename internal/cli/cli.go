@@ -9,14 +9,15 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/ezke5/pi/internal/archive"
 	"github.com/ezke5/pi/internal/config"
+	"github.com/ezke5/pi/internal/deps"
 	"github.com/ezke5/pi/internal/fetch"
 	"github.com/ezke5/pi/internal/footprint"
 	"github.com/ezke5/pi/internal/pkgbuild"
 	"github.com/ezke5/pi/internal/rootfs"
+	"github.com/ezke5/pi/internal/state"
 )
 
 func Run(args []string, stdout, stderr io.Writer) error {
@@ -34,6 +35,7 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	root := fs.String("root", "", "target CRUX root")
 	configPath := fs.String("config", "", "INI configuration file")
 	allowHost := fs.Bool("allow-host-root", false, "explicitly allow operating on /")
+	force := fs.Bool("force", false, "override dependency safety checks")
 	dryRun := fs.Bool("dry-run", false, "show operations without changing the target")
 	reuse := fs.Bool("reuse", true, "reuse cached sources")
 	if err := fs.Parse(global); err != nil {
@@ -74,11 +76,11 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	case "info", "inspect":
 		return cmdInfo(c, pos[1:], stdout)
 	case "build":
-		return cmdBuild(c, pos[1:], *reuse, dryRun, stdout)
+		return cmdBuild(c, pos[1:], *reuse, *dryRun, stdout)
 	case "install":
-		return cmdInstall(c, pos[1:], *allowHost, dryRun, stdout)
+		return cmdInstall(c, pos[1:], *allowHost, *force, *dryRun, *reuse, stdout)
 	case "remove":
-		return cmdRemove(c, pos[1:], *allowHost, dryRun, stdout)
+		return cmdRemove(c, pos[1:], *allowHost, *force, *dryRun, stdout)
 	case "list":
 		return cmdList(c, *allowHost, stdout)
 	default:
@@ -87,21 +89,43 @@ func Run(args []string, stdout, stderr io.Writer) error {
 }
 
 func splitFlags(args []string) ([]string, []string) {
-	known := map[string]bool{"--ports": true, "--work": true, "--temp": true, "--cache": true, "--root": true, "--config": true, "--allow-host-root": true, "--dry-run": true, "--reuse": true}
+	valueFlags := map[string]bool{
+		"--ports": true, "--work": true, "--temp": true, "--cache": true,
+		"--root": true, "--config": true,
+	}
+	boolFlags := map[string]bool{
+		"--allow-host-root": true, "--dry-run": true, "--reuse": true, "--force": true,
+	}
 	global := []string{}
 	rest := []string{}
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		if known[arg] || strings.HasPrefix(arg, "--ports=") || strings.HasPrefix(arg, "--work=") ||
-			strings.HasPrefix(arg, "--temp=") || strings.HasPrefix(arg, "--cache=") ||
-			strings.HasPrefix(arg, "--root=") || strings.HasPrefix(arg, "--config=") ||
-			strings.HasPrefix(arg, "--reuse=") {
-			global = append(global, arg)
-			if known[arg] && !strings.Contains(arg, "=") && i+1 < len(args) && arg != "--allow-host-root" && arg != "--dry-run" && arg != "--reuse" {
-				i++
-				global = append(global, args[i])
+		matched := false
+		for flagName := range valueFlags {
+			if arg == flagName || strings.HasPrefix(arg, flagName+"=") {
+				global = append(global, arg)
+				if arg == flagName && i+1 < len(args) {
+					next := args[i+1]
+					isSubcommand := next == "init" || next == "info" || next == "inspect" || next == "build" || next == "install" || next == "remove" || next == "list" || next == "help"
+					if !strings.HasPrefix(next, "--") && !isSubcommand {
+						i++
+						global = append(global, next)
+					}
+				}
+				matched = true
+				break
 			}
-		} else {
+		}
+		if !matched {
+			for flagName := range boolFlags {
+				if arg == flagName || strings.HasPrefix(arg, flagName+"=") {
+					global = append(global, arg)
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched {
 			rest = append(rest, arg)
 		}
 	}
@@ -121,7 +145,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Global flags:")
 	fmt.Fprintln(w, "  --root, --ports, --work, --temp, --cache, --config")
-	fmt.Fprintln(w, "  --dry-run, --allow-host-root")
+	fmt.Fprintln(w, "  --dry-run, --allow-host-root, --force")
 }
 
 func cmdInit(c config.Config, configPath string, args []string, stdout io.Writer) error {
@@ -173,29 +197,35 @@ func cmdInfo(c config.Config, args []string, stdout io.Writer) error {
 	return nil
 }
 
-func cmdBuild(c config.Config, args []string, reuse bool, dryRun *bool, stdout io.Writer) error {
+func cmdBuild(c config.Config, args []string, reuse bool, dryRun bool, stdout io.Writer) error {
 	if len(args) == 0 {
 		return fmt.Errorf("build requires a PKGBUILD path or package name")
+	}
+	graph, err := (deps.Resolver{Ports: c.Ports}).Resolve(args[0])
+	if err != nil {
+		return err
+	}
+	for i, r := range graph.Recipes() {
+		fmt.Fprintf(stdout, "%d. %s-%s-%s (build from PKGBUILD)\n", i+1, r.Pkgname, r.Pkgver, r.Pkgrel)
+	}
+	if dryRun {
+		return nil
 	}
 	if err := c.EnsureDirs(); err != nil {
 		return err
 	}
-	path, err := pkgbuild.Find(c.Ports, args[0])
-	if err != nil {
-		return err
+	for _, r := range graph.Recipes() {
+		if err := cmdBuildRecipe(c, r, reuse, stdout); err != nil {
+			return err
+		}
 	}
-	r, err := pkgbuild.Read(path)
-	if err != nil {
-		return err
-	}
+	return nil
+}
+
+func cmdBuildRecipe(c config.Config, r pkgbuild.Recipe, reuse bool, stdout io.Writer) error {
 	buildDir := filepath.Join(c.Work, r.Pkgname+"-"+r.Pkgver)
 	srcDir := filepath.Join(buildDir, "src")
 	pkgDir := filepath.Join(buildDir, "pkg")
-	if *dryRun {
-		fmt.Fprintf(stdout, "dry-run: build %s-%s-%s in %s\n", r.Pkgname, r.Pkgver, r.Pkgrel, buildDir)
-		fmt.Fprintf(stdout, "dry-run: package archive %s\n", filepath.Join(c.Binpkgs, r.ArchiveName()))
-		return nil
-	}
 	if err := os.RemoveAll(buildDir); err != nil {
 		return fmt.Errorf("clean build work directory %q: %w", buildDir, err)
 	}
@@ -207,59 +237,15 @@ func cmdBuild(c config.Config, args []string, reuse bool, dryRun *bool, stdout i
 	}
 
 	for i, source := range r.Source {
-		rawURL := source
-		sourceName := ""
-		if strings.Contains(source, "::") {
-			parts := strings.SplitN(source, "::", 2)
-			sourceName, rawURL = parts[0], parts[1]
+		sourceResult, err := fetch.ResolveSource(source, filepath.Dir(r.Path), c.Cache, reuse, os.Stdin, stdout)
+		if err != nil {
+			return fmt.Errorf("%s", fetch.ManualDownloadNotice(fmt.Errorf("source %q for %s: %w", source, r.Pkgname, err)))
 		}
-		var local string
-		if strings.Contains(rawURL, "://") {
-			base := filepath.Base(strings.SplitN(rawURL, "?", 2)[0])
-			if sourceName == "" {
-				sourceName = base
-			}
-			local = filepath.Join(c.Cache, base)
-			if info, statErr := os.Stat(local); statErr == nil && !info.IsDir() {
-				shouldReuse := reuse
-				if !reuse {
-					if fileInfo, infoErr := os.Stdin.Stat(); infoErr == nil && fileInfo.Mode()&os.ModeCharDevice != 0 {
-						shouldReuse, infoErr = fetch.ConfirmReuse(local, os.Stdin, stdout)
-						if infoErr != nil {
-							return infoErr
-						}
-					}
-				}
-				if shouldReuse {
-					fmt.Fprintf(stdout, "reusing cached source %s\n", local)
-				} else if err := os.Remove(local); err != nil {
-					return fmt.Errorf("remove cached source %q: %w", local, err)
-				} else if err := fetch.Download(rawURL, local, 30*time.Second); err != nil {
-					return fmt.Errorf("%s", fetch.ManualDownloadNotice(err))
-				}
-			} else {
-				if err := fetch.Download(rawURL, local, 30*time.Second); err != nil {
-					return fmt.Errorf("%s", fetch.ManualDownloadNotice(err))
-				}
-			}
-		} else {
-			local = source
-			if !filepath.IsAbs(local) {
-				local = filepath.Join(filepath.Dir(r.Path), local)
-			}
-			if sourceName == "" {
-				sourceName = filepath.Base(local)
-			}
-		}
-		if info, err := os.Stat(local); err != nil || info.IsDir() {
-			if os.IsNotExist(err) {
-				return fmt.Errorf("%s", fetch.ManualDownloadNotice(fmt.Errorf("missing local source file %q", local)))
-			}
-			return fmt.Errorf("source %q is not a regular file", local)
-		}
+		local := sourceResult.Path
+		sourceName := sourceResult.Name
 		if i < len(r.SHA256Sums) && r.SHA256Sums[i] != "" && r.SHA256Sums[i] != "SKIP" {
 			if _, err := fetch.VerifySHA256(local, r.SHA256Sums[i]); err != nil {
-				return fmt.Errorf("%s", fetch.ManualDownloadNotice(err))
+				return fmt.Errorf("%s", fetch.ManualDownloadNotice(fmt.Errorf("source %q for %s: %w", source, r.Pkgname, err)))
 			}
 		}
 		// Copy source archives into srcdir for build().
@@ -305,7 +291,7 @@ func cmdBuild(c config.Config, args []string, reuse bool, dryRun *bool, stdout i
 		return err
 	}
 	output := filepath.Join(c.Binpkgs, r.ArchiveName())
-	if err := archive.Create(pkgDir, output, r.Pkgname, r.Pkgver, r.Pkgrel, entries); err != nil {
+	if err := archive.Create(pkgDir, output, r.Pkgname, r.Pkgver, r.Pkgrel, entries, r.Backup); err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "built %s\n", output)
@@ -329,7 +315,7 @@ func copyFile(src, dest string) error {
 	return out.Close()
 }
 
-func cmdInstall(c config.Config, args []string, allowHost bool, dryRun *bool, stdout io.Writer) error {
+func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse bool, stdout io.Writer) error {
 	if len(args) == 0 {
 		return fmt.Errorf("install requires a .pkg.tar.zst archive or package name")
 	}
@@ -337,45 +323,184 @@ func cmdInstall(c config.Config, args []string, allowHost bool, dryRun *bool, st
 	if err != nil {
 		return err
 	}
-	archivePath := args[0]
-	if info, statErr := os.Stat(archivePath); statErr != nil || info.IsDir() {
-		if strings.HasSuffix(archivePath, ".pkg.tar.zst") {
-			archivePath = filepath.Join(c.Binpkgs, archivePath)
+	if strings.HasSuffix(args[0], ".pkg.tar.zst") {
+		archivePath := args[0]
+		if _, statErr := os.Stat(archivePath); statErr != nil {
+			archivePath = filepath.Join(c.Binpkgs, filepath.Base(args[0]))
+		}
+		info, infoErr := archive.ReadInfo(archivePath)
+		record := state.Record{}
+		if infoErr == nil {
+			record = state.Record{Pkgname: info.Pkgname, Pkgver: info.Pkgver, Pkgrel: info.Pkgrel, Backup: info.Backup, Depends: info.Depends}
 		} else {
-			path, findErr := pkgbuild.Find(c.Ports, archivePath)
-			if findErr == nil {
-				r, readErr := pkgbuild.Read(path)
-				if readErr != nil {
-					return readErr
-				}
-				exact := filepath.Join(c.Binpkgs, r.ArchiveName())
-				if _, exactErr := os.Stat(exact); exactErr == nil {
-					archivePath = exact
-				} else {
-					archivePath = findPackageArchive(c.Binpkgs, r.Pkgname)
-				}
-			} else {
-				archivePath = findPackageArchive(c.Binpkgs, archivePath)
+			base := strings.TrimSuffix(filepath.Base(archivePath), ".pkg.tar.zst")
+			record.Pkgname = base
+		}
+		status := "new install"
+		if record.Pkgname != "" {
+			installed, loadErr := state.Load(target, record.Pkgname)
+			if loadErr == nil && installed.Pkgver != "" {
+				status = fmt.Sprintf("already installed (%s-%s -> %s-%s)", installed.Pkgver, installed.Pkgrel, record.Pkgver, record.Pkgrel)
 			}
 		}
-	} else if !strings.HasSuffix(archivePath, ".pkg.tar.zst") {
-		archivePath = filepath.Join(c.Binpkgs, archivePath)
-	}
-	if archivePath == "" {
-		return fmt.Errorf("package archive for %q not found in cache %q", args[0], c.Binpkgs)
-	}
-	if _, err := os.Stat(archivePath); err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("package archive %q not found; build it first or place it in cache %q", archivePath, c.Binpkgs)
+		fmt.Fprintf(stdout, "1. %s: %s; existing archive\n", filepath.Base(archivePath), status)
+		if dryRun {
+			return installArchive(c, target, archivePath, record, force, true, stdout)
 		}
-
-		return fmt.Errorf("inspect package archive %q: %w", archivePath, err)
+		return installArchive(c, target, archivePath, record, force, false, stdout)
 	}
-	if *dryRun {
+	if archivePath := findPackageArchive(c.Binpkgs, args[0]); archivePath != "" {
+		if _, statErr := os.Stat(filepath.Join(c.Ports, args[0], "PKGBUILD")); statErr != nil {
+			info, infoErr := archive.ReadInfo(archivePath)
+			record := state.Record{Pkgname: args[0]}
+			if infoErr == nil {
+				record = state.Record{Pkgname: info.Pkgname, Pkgver: info.Pkgver, Pkgrel: info.Pkgrel, Backup: info.Backup, Depends: info.Depends}
+			}
+			status := "new install"
+			if record.Pkgname != "" {
+				installed, loadErr := state.Load(target, record.Pkgname)
+				if loadErr == nil && installed.Pkgver != "" {
+					status = fmt.Sprintf("already installed (%s-%s -> %s-%s)", installed.Pkgver, installed.Pkgrel, record.Pkgver, record.Pkgrel)
+				}
+			}
+			fmt.Fprintf(stdout, "1. %s: %s; existing archive\n", filepath.Base(archivePath), status)
+			if dryRun {
+				return installArchive(c, target, archivePath, record, force, true, stdout)
+			}
+			return installArchive(c, target, archivePath, record, force, false, stdout)
+		}
+	}
+	graph, err := (deps.Resolver{Ports: c.Ports}).Resolve(args[0])
+	if err != nil {
+		archivePath := findPackageArchive(c.Binpkgs, args[0])
+		if archivePath == "" {
+			return err
+		}
+		info, infoErr := archive.ReadInfo(archivePath)
+		record := state.Record{Pkgname: args[0]}
+		if infoErr == nil {
+			record = state.Record{Pkgname: info.Pkgname, Pkgver: info.Pkgver, Pkgrel: info.Pkgrel, Backup: info.Backup, Depends: info.Depends}
+		}
+		fmt.Fprintf(stdout, "1. %s: new install; existing archive\n", filepath.Base(archivePath))
+		if dryRun {
+			return installArchive(c, target, archivePath, record, force, true, stdout)
+		}
+		return installArchive(c, target, archivePath, record, force, false, stdout)
+	}
+	if len(graph.Order) == 0 {
+		archivePath := args[0]
+		if _, statErr := os.Stat(archivePath); statErr != nil {
+			archivePath = filepath.Join(c.Binpkgs, filepath.Base(args[0]))
+		}
+		return installArchive(c, target, archivePath, state.Record{Pkgname: strings.TrimSuffix(filepath.Base(archivePath), ".pkg.tar.zst")}, force, dryRun, stdout)
+	}
+	for i, name := range graph.Order {
+		r := graph.Nodes[name].Recipe
+		archivePath := filepath.Join(c.Binpkgs, r.ArchiveName())
+		source := "existing archive"
+		if _, statErr := os.Stat(archivePath); os.IsNotExist(statErr) {
+			archivePath = findPackageArchive(c.Binpkgs, r.Pkgname)
+		}
+		if archivePath == "" {
+			source = "build from PKGBUILD"
+			archivePath = filepath.Join(c.Binpkgs, r.ArchiveName())
+		}
+		record, _ := state.Load(target, r.Pkgname)
+		status := "new install"
+		if record.Pkgname == r.Pkgname && record.Pkgver != "" {
+			status = fmt.Sprintf("already installed (%s-%s -> %s-%s)", record.Pkgver, record.Pkgrel, r.Pkgver, r.Pkgrel)
+		}
+		fmt.Fprintf(stdout, "%d. %s-%s-%s: %s; %s\n", i+1, r.Pkgname, r.Pkgver, r.Pkgrel, status, source)
+		if dryRun {
+			continue
+		}
+		if source == "build from PKGBUILD" {
+			if err := c.EnsureDirs(); err != nil {
+				return err
+			}
+			if err := cmdBuildRecipe(c, r, reuse, stdout); err != nil {
+				return err
+			}
+		}
+		if err := installArchive(c, target, archivePath, state.Record{Pkgname: r.Pkgname, Pkgver: r.Pkgver, Pkgrel: r.Pkgrel, Depends: append(r.Depends, r.MakeDepends...), Backup: r.Backup}, force, false, stdout); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func installArchive(c config.Config, target, archivePath string, record state.Record, force, dryRun bool, stdout io.Writer) error {
+	if _, err := os.Stat(archivePath); err != nil {
+		return fmt.Errorf("package archive %q not found; build it first or place it in cache %q", archivePath, c.Binpkgs)
+	}
+	entries, err := archive.Entries(archivePath)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Type == "dir" || contains(record.Backup, strings.TrimPrefix(entry.Path, "/")) {
+			continue
+		}
+		owned, err := state.OwnedByOthers(target, record.Pkgname, entry.Path)
+		if err != nil {
+			return err
+		}
+		if owned && !force {
+			return fmt.Errorf("file conflict: %s is owned by another installed package (use --force to override)", entry.Path)
+		}
+	}
+	if dryRun {
 		fmt.Fprintf(stdout, "dry-run: install %s into %s\n", archivePath, target)
 		return nil
 	}
+	oldEntries, err := state.Footprint(target, record.Pkgname)
+	if err != nil {
+		return err
+	}
 	if err := archive.Extract("", archivePath, target); err != nil {
+		return err
+	}
+	newPaths := map[string]bool{}
+	for _, entry := range entries {
+		newPaths[entry.Path] = true
+	}
+	for _, old := range oldEntries {
+		if newPaths[old.Path] || strings.HasPrefix(old.Path, "/etc/") || contains(record.Backup, strings.TrimPrefix(old.Path, "/")) {
+			continue
+		}
+		owned, err := state.OwnedByOthers(target, record.Pkgname, old.Path)
+		if err != nil {
+			return err
+		}
+		if owned {
+			continue
+		}
+		path, err := rootfs.TargetPath(target, old.Path)
+		if err != nil {
+			return err
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove stale package path %q: %w", old.Path, err)
+		}
+	}
+	for i := len(oldEntries) - 1; i >= 0; i-- {
+		old := oldEntries[i]
+		if old.Type != "dir" || newPaths[old.Path] {
+			continue
+		}
+		owned, err := state.OwnedByOthers(target, record.Pkgname, old.Path)
+		if err != nil {
+			return err
+		}
+		if owned {
+			continue
+		}
+		path, err := rootfs.TargetPath(target, old.Path)
+		if err == nil {
+			_ = os.Remove(path)
+		}
+	}
+	if err := state.Write(target, record, entries); err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "installed %s into %s\n", archivePath, target)
@@ -436,7 +561,7 @@ func comparePackageVersions(a, b string) int {
 	return 0
 }
 
-func cmdRemove(c config.Config, args []string, allowHost bool, dryRun *bool, stdout io.Writer) error {
+func cmdRemove(c config.Config, args []string, allowHost, force, dryRun bool, stdout io.Writer) error {
 	if len(args) == 0 {
 		return fmt.Errorf("remove requires a package name")
 	}
@@ -444,7 +569,36 @@ func cmdRemove(c config.Config, args []string, allowHost bool, dryRun *bool, std
 	if err != nil {
 		return err
 	}
-	if *dryRun {
+	if !force {
+		records, err := state.Installed(target)
+		if err != nil {
+			return err
+		}
+		var dependents []string
+		for _, record := range records {
+			for _, dep := range record.Depends {
+				fields := strings.Fields(dep)
+				if len(fields) == 0 {
+					continue
+				}
+				depName := strings.TrimSpace(fields[0])
+				for _, op := range []string{">=", "<=", ">", "<", "="} {
+					if i := strings.Index(depName, op); i >= 0 {
+						depName = depName[:i]
+						break
+					}
+				}
+				if depName == args[0] {
+					dependents = append(dependents, record.Pkgname)
+					break
+				}
+			}
+		}
+		if len(dependents) > 0 {
+			return fmt.Errorf("cannot remove %q: installed packages depend on it: %s (use --force)", args[0], strings.Join(dependents, ", "))
+		}
+	}
+	if dryRun {
 		fmt.Fprintf(stdout, "dry-run: remove package %s from %s\n", args[0], target)
 		return nil
 	}
@@ -474,6 +628,13 @@ func cmdRemove(c config.Config, args []string, allowHost bool, dryRun *bool, std
 			fmt.Fprintf(stdout, "preserving config file %s\n", entry.Path)
 			continue
 		}
+		owned, err := state.OwnedByOthers(target, args[0], entry.Path)
+		if err != nil {
+			return err
+		}
+		if owned {
+			continue
+		}
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove package-owned file %q: %w", path, err)
 		}
@@ -481,6 +642,8 @@ func cmdRemove(c config.Config, args []string, allowHost bool, dryRun *bool, std
 	if err := os.Remove(footprintPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove package footprint %q: %w", footprintPath, err)
 	}
+	recordDir, _ = state.RecordDir(target)
+	_ = os.Remove(filepath.Join(recordDir, args[0]+".meta"))
 	fmt.Fprintf(stdout, "removed %s\n", args[0])
 	return nil
 }
