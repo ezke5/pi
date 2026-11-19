@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/ezke5/pi/internal/archive"
 	"github.com/ezke5/pi/internal/config"
@@ -238,59 +237,15 @@ func cmdBuildRecipe(c config.Config, r pkgbuild.Recipe, reuse bool, stdout io.Wr
 	}
 
 	for i, source := range r.Source {
-		rawURL := source
-		sourceName := ""
-		if strings.Contains(source, "::") {
-			parts := strings.SplitN(source, "::", 2)
-			sourceName, rawURL = parts[0], parts[1]
+		sourceResult, err := fetch.ResolveSource(source, filepath.Dir(r.Path), c.Cache, reuse, os.Stdin, stdout)
+		if err != nil {
+			return fmt.Errorf("%s", fetch.ManualDownloadNotice(fmt.Errorf("source %q for %s: %w", source, r.Pkgname, err)))
 		}
-		var local string
-		if strings.Contains(rawURL, "://") {
-			base := filepath.Base(strings.SplitN(rawURL, "?", 2)[0])
-			if sourceName == "" {
-				sourceName = base
-			}
-			local = filepath.Join(c.Cache, base)
-			if info, statErr := os.Stat(local); statErr == nil && !info.IsDir() {
-				shouldReuse := reuse
-				if !reuse {
-					if fileInfo, infoErr := os.Stdin.Stat(); infoErr == nil && fileInfo.Mode()&os.ModeCharDevice != 0 {
-						shouldReuse, infoErr = fetch.ConfirmReuse(local, os.Stdin, stdout)
-						if infoErr != nil {
-							return infoErr
-						}
-					}
-				}
-				if shouldReuse {
-					fmt.Fprintf(stdout, "reusing cached source %s\n", local)
-				} else if err := os.Remove(local); err != nil {
-					return fmt.Errorf("remove cached source %q: %w", local, err)
-				} else if err := fetch.Download(rawURL, local, 30*time.Second); err != nil {
-					return fmt.Errorf("%s", fetch.ManualDownloadNotice(err))
-				}
-			} else {
-				if err := fetch.Download(rawURL, local, 30*time.Second); err != nil {
-					return fmt.Errorf("%s", fetch.ManualDownloadNotice(err))
-				}
-			}
-		} else {
-			local = source
-			if !filepath.IsAbs(local) {
-				local = filepath.Join(filepath.Dir(r.Path), local)
-			}
-			if sourceName == "" {
-				sourceName = filepath.Base(local)
-			}
-		}
-		if info, err := os.Stat(local); err != nil || info.IsDir() {
-			if os.IsNotExist(err) {
-				return fmt.Errorf("%s", fetch.ManualDownloadNotice(fmt.Errorf("missing local source file %q", local)))
-			}
-			return fmt.Errorf("source %q is not a regular file", local)
-		}
+		local := sourceResult.Path
+		sourceName := sourceResult.Name
 		if i < len(r.SHA256Sums) && r.SHA256Sums[i] != "" && r.SHA256Sums[i] != "SKIP" {
 			if _, err := fetch.VerifySHA256(local, r.SHA256Sums[i]); err != nil {
-				return fmt.Errorf("%s", fetch.ManualDownloadNotice(err))
+				return fmt.Errorf("%s", fetch.ManualDownloadNotice(fmt.Errorf("source %q for %s: %w", source, r.Pkgname, err)))
 			}
 		}
 		// Copy source archives into srcdir for build().

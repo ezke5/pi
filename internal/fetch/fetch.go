@@ -16,7 +16,79 @@ import (
 
 type Result struct {
 	Path   string
+	Name   string
 	Reused bool
+}
+
+// ResolveSource returns a local source path, downloading HTTP(S) sources into
+// cache when needed. Relative local sources are resolved from recipeDir.
+func ResolveSource(rawSource, recipeDir, cache string, reuse bool, in io.Reader, out io.Writer) (Result, error) {
+	sourceName, rawURL := splitSourceName(rawSource)
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return Result{}, fmt.Errorf("parse source %q: %w", rawSource, err)
+	}
+	if parsed.Scheme == "" {
+		local := rawURL
+		if !filepath.IsAbs(local) {
+			local = filepath.Join(recipeDir, local)
+		}
+		if sourceName == "" {
+			sourceName = filepath.Base(local)
+		}
+		info, statErr := os.Stat(local)
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				return Result{}, fmt.Errorf("local source %q is missing from recipe directory %q", rawURL, recipeDir)
+			}
+			return Result{}, fmt.Errorf("inspect local source %q: %w", local, statErr)
+		}
+		if info.IsDir() {
+			return Result{}, fmt.Errorf("local source %q is a directory, not a file", local)
+		}
+		return Result{Path: local, Name: sourceName}, nil
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return Result{}, fmt.Errorf("unsupported source URL scheme %q in %q", parsed.Scheme, rawSource)
+	}
+	base := filepath.Base(parsed.Path)
+	if base == "." || base == "/" || base == "" {
+		return Result{}, fmt.Errorf("source URL %q does not contain a filename", rawURL)
+	}
+	if sourceName == "" {
+		sourceName = base
+	}
+	local := filepath.Join(cache, base)
+	if info, statErr := os.Stat(local); statErr == nil && !info.IsDir() {
+		if reuse {
+			fmt.Fprintf(out, "reusing cached source %s\n", local)
+			return Result{Path: local, Name: sourceName, Reused: true}, nil
+		}
+		if file, ok := in.(*os.File); ok {
+			if fileInfo, infoErr := file.Stat(); infoErr == nil && fileInfo.Mode()&os.ModeCharDevice != 0 {
+				shouldReuse, confirmErr := ConfirmReuse(local, in, out)
+				if confirmErr != nil {
+					return Result{}, confirmErr
+				}
+				if shouldReuse {
+					return Result{Path: local, Name: sourceName, Reused: true}, nil
+				}
+			}
+		}
+	} else if statErr != nil && !os.IsNotExist(statErr) {
+		return Result{}, fmt.Errorf("inspect cached source %q: %w", local, statErr)
+	}
+	if err := Download(rawURL, local, 30*time.Second); err != nil {
+		return Result{}, err
+	}
+	return Result{Path: local, Name: sourceName}, nil
+}
+
+func splitSourceName(source string) (string, string) {
+	if name, value, ok := strings.Cut(source, "::"); ok {
+		return name, value
+	}
+	return "", source
 }
 
 func ConfirmReuse(path string, in io.Reader, out io.Writer) (bool, error) {
