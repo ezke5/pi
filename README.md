@@ -1,6 +1,8 @@
 # pi
 
-`pi` is a source-first package manager starter for CRUX Linux.
+`pi` is a package manager starter for CRUX Linux. `pi install` prefers the
+highest-version matching cached binary archive and falls back to building from
+the dependency-resolved PKGBUILD graph when no cached archive is available.
 
 ## Build
 
@@ -25,7 +27,8 @@ build and install testing.
 Global INI configuration is loaded from `pi.ini`, `.pi.ini`, or
 `~/.config/pi/config.ini`. CLI flags override INI values.
 
-`pi build` exports the recipe metadata variables (`pkgname`, `pkgver`,
+`pi build` expands `pkgname`, `pkgver`, and `pkgrel` references in `source`
+entries, then exports the recipe metadata variables (`pkgname`, `pkgver`,
 `pkgrel`, `srcdir`, and `pkgdir`) to `build()` and `package()`, clears
 `CONFIG_SITE`, and extracts standard source archives into `srcdir` while
 retaining the staged archive. Use `--reuse` to accept cached sources; when

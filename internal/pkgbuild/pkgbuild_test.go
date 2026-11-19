@@ -77,6 +77,33 @@ package() {
 	}
 }
 
+func TestReadExpandsRecipeVariablesInSources(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "PKGBUILD")
+	content := `source=(
+  "named::https://example.test/${pkgname}-$pkgver-$pkgrel.tar.gz"
+  "$pkgname-$pkgver-$pkgrel.patch"
+)
+pkgname=demo
+pkgver=1.2
+pkgrel=3
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"named::https://example.test/demo-1.2-3.tar.gz",
+		"demo-1.2-3.patch",
+	}
+	if strings.Join(r.Source, "|") != strings.Join(want, "|") {
+		t.Fatalf("sources = %#v, want %#v", r.Source, want)
+	}
+}
+
 func TestFindRepositorySubdirectories(t *testing.T) {
 	ports := t.TempDir()
 	for _, repo := range []string{"extra", "core"} {

@@ -396,15 +396,7 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse 
 	}
 	for i, name := range graph.Order {
 		r := graph.Nodes[name].Recipe
-		archivePath := filepath.Join(c.Binpkgs, r.ArchiveName())
-		source := "existing archive"
-		if _, statErr := os.Stat(archivePath); os.IsNotExist(statErr) {
-			archivePath = findPackageArchive(c.Binpkgs, r.Pkgname)
-		}
-		if archivePath == "" {
-			source = "build from PKGBUILD"
-			archivePath = filepath.Join(c.Binpkgs, r.ArchiveName())
-		}
+		archivePath, source := selectInstallArchive(c.Binpkgs, r)
 		record, _ := state.Load(target, r.Pkgname)
 		status := "new install"
 		if record.Pkgname == r.Pkgname && record.Pkgver != "" {
@@ -518,6 +510,7 @@ func contains(values []string, value string) bool {
 
 func findPackageArchive(dir, name string) string {
 	matches, _ := filepath.Glob(filepath.Join(dir, name+"-*.pkg.tar.zst"))
+	matches = filterRegularFiles(matches)
 	if len(matches) == 0 {
 		return ""
 	}
@@ -525,6 +518,32 @@ func findPackageArchive(dir, name string) string {
 		return comparePackageVersions(packageVersion(filepath.Base(matches[i]), name), packageVersion(filepath.Base(matches[j]), name)) < 0
 	})
 	return matches[len(matches)-1]
+}
+
+func selectInstallArchive(cache string, recipe pkgbuild.Recipe) (string, string) {
+	exact := filepath.Join(cache, recipe.ArchiveName())
+	if isRegularFile(exact) {
+		return exact, "existing archive"
+	}
+	if archivePath := findPackageArchive(cache, recipe.Pkgname); archivePath != "" {
+		return archivePath, "existing archive"
+	}
+	return exact, "build from PKGBUILD"
+}
+
+func filterRegularFiles(paths []string) []string {
+	filtered := paths[:0]
+	for _, path := range paths {
+		if isRegularFile(path) {
+			filtered = append(filtered, path)
+		}
+	}
+	return filtered
+}
+
+func isRegularFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
 }
 
 func packageVersion(filename, name string) string {
