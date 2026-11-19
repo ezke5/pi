@@ -94,11 +94,12 @@ func Write(path string, entries []Entry) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create footprint directory: %w", err)
 	}
-	f, err := os.Create(path)
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
 	if err != nil {
 		return fmt.Errorf("create footprint %q: %w", path, err)
 	}
-	defer f.Close()
+	tmpName := f.Name()
+	defer os.Remove(tmpName)
 	for _, entry := range entries {
 		var line string
 		switch entry.Type {
@@ -112,6 +113,12 @@ func Write(path string, entries []Entry) error {
 		if _, err := fmt.Fprintln(f, line); err != nil {
 			return fmt.Errorf("write footprint %q: %w", path, err)
 		}
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close footprint %q: %w", path, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("commit footprint %q: %w", path, err)
 	}
 	return nil
 }

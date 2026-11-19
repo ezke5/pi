@@ -90,21 +90,43 @@ func Run(args []string, stdout, stderr io.Writer) error {
 }
 
 func splitFlags(args []string) ([]string, []string) {
-	known := map[string]bool{"--ports": true, "--work": true, "--temp": true, "--cache": true, "--root": true, "--config": true, "--allow-host-root": true, "--dry-run": true, "--reuse": true, "--force": true}
+	valueFlags := map[string]bool{
+		"--ports": true, "--work": true, "--temp": true, "--cache": true,
+		"--root": true, "--config": true,
+	}
+	boolFlags := map[string]bool{
+		"--allow-host-root": true, "--dry-run": true, "--reuse": true, "--force": true,
+	}
 	global := []string{}
 	rest := []string{}
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		if known[arg] || strings.HasPrefix(arg, "--ports=") || strings.HasPrefix(arg, "--work=") ||
-			strings.HasPrefix(arg, "--temp=") || strings.HasPrefix(arg, "--cache=") ||
-			strings.HasPrefix(arg, "--root=") || strings.HasPrefix(arg, "--config=") ||
-			strings.HasPrefix(arg, "--reuse=") {
-			global = append(global, arg)
-			if known[arg] && !strings.Contains(arg, "=") && i+1 < len(args) && arg != "--allow-host-root" && arg != "--dry-run" && arg != "--reuse" {
-				i++
-				global = append(global, args[i])
+		matched := false
+		for flagName := range valueFlags {
+			if arg == flagName || strings.HasPrefix(arg, flagName+"=") {
+				global = append(global, arg)
+				if arg == flagName && i+1 < len(args) {
+					next := args[i+1]
+					isSubcommand := next == "init" || next == "info" || next == "inspect" || next == "build" || next == "install" || next == "remove" || next == "list" || next == "help"
+					if !strings.HasPrefix(next, "--") && !isSubcommand {
+						i++
+						global = append(global, next)
+					}
+				}
+				matched = true
+				break
 			}
-		} else {
+		}
+		if !matched {
+			for flagName := range boolFlags {
+				if arg == flagName || strings.HasPrefix(arg, flagName+"=") {
+					global = append(global, arg)
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched {
 			rest = append(rest, arg)
 		}
 	}
@@ -314,7 +336,7 @@ func cmdBuildRecipe(c config.Config, r pkgbuild.Recipe, reuse bool, stdout io.Wr
 		return err
 	}
 	output := filepath.Join(c.Binpkgs, r.ArchiveName())
-	if err := archive.Create(pkgDir, output, r.Pkgname, r.Pkgver, r.Pkgrel, entries); err != nil {
+	if err := archive.Create(pkgDir, output, r.Pkgname, r.Pkgver, r.Pkgrel, entries, r.Backup); err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "built %s\n", output)
@@ -346,13 +368,69 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse 
 	if err != nil {
 		return err
 	}
+	if strings.HasSuffix(args[0], ".pkg.tar.zst") {
+		archivePath := args[0]
+		if _, statErr := os.Stat(archivePath); statErr != nil {
+			archivePath = filepath.Join(c.Binpkgs, filepath.Base(args[0]))
+		}
+		info, infoErr := archive.ReadInfo(archivePath)
+		record := state.Record{}
+		if infoErr == nil {
+			record = state.Record{Pkgname: info.Pkgname, Pkgver: info.Pkgver, Pkgrel: info.Pkgrel, Backup: info.Backup, Depends: info.Depends}
+		} else {
+			base := strings.TrimSuffix(filepath.Base(archivePath), ".pkg.tar.zst")
+			record.Pkgname = base
+		}
+		status := "new install"
+		if record.Pkgname != "" {
+			installed, loadErr := state.Load(target, record.Pkgname)
+			if loadErr == nil && installed.Pkgver != "" {
+				status = fmt.Sprintf("already installed (%s-%s -> %s-%s)", installed.Pkgver, installed.Pkgrel, record.Pkgver, record.Pkgrel)
+			}
+		}
+		fmt.Fprintf(stdout, "1. %s: %s; existing archive\n", filepath.Base(archivePath), status)
+		if dryRun {
+			return installArchive(c, target, archivePath, record, force, true, stdout)
+		}
+		return installArchive(c, target, archivePath, record, force, false, stdout)
+	}
+	if archivePath := findPackageArchive(c.Binpkgs, args[0]); archivePath != "" {
+		if _, statErr := os.Stat(filepath.Join(c.Ports, args[0], "PKGBUILD")); statErr != nil {
+			info, infoErr := archive.ReadInfo(archivePath)
+			record := state.Record{Pkgname: args[0]}
+			if infoErr == nil {
+				record = state.Record{Pkgname: info.Pkgname, Pkgver: info.Pkgver, Pkgrel: info.Pkgrel, Backup: info.Backup, Depends: info.Depends}
+			}
+			status := "new install"
+			if record.Pkgname != "" {
+				installed, loadErr := state.Load(target, record.Pkgname)
+				if loadErr == nil && installed.Pkgver != "" {
+					status = fmt.Sprintf("already installed (%s-%s -> %s-%s)", installed.Pkgver, installed.Pkgrel, record.Pkgver, record.Pkgrel)
+				}
+			}
+			fmt.Fprintf(stdout, "1. %s: %s; existing archive\n", filepath.Base(archivePath), status)
+			if dryRun {
+				return installArchive(c, target, archivePath, record, force, true, stdout)
+			}
+			return installArchive(c, target, archivePath, record, force, false, stdout)
+		}
+	}
 	graph, err := (deps.Resolver{Ports: c.Ports}).Resolve(args[0])
 	if err != nil {
-		if strings.HasSuffix(args[0], ".pkg.tar.zst") {
-			graph = deps.Graph{}
-		} else {
+		archivePath := findPackageArchive(c.Binpkgs, args[0])
+		if archivePath == "" {
 			return err
 		}
+		info, infoErr := archive.ReadInfo(archivePath)
+		record := state.Record{Pkgname: args[0]}
+		if infoErr == nil {
+			record = state.Record{Pkgname: info.Pkgname, Pkgver: info.Pkgver, Pkgrel: info.Pkgrel, Backup: info.Backup, Depends: info.Depends}
+		}
+		fmt.Fprintf(stdout, "1. %s: new install; existing archive\n", filepath.Base(archivePath))
+		if dryRun {
+			return installArchive(c, target, archivePath, record, force, true, stdout)
+		}
+		return installArchive(c, target, archivePath, record, force, false, stdout)
 	}
 	if len(graph.Order) == 0 {
 		archivePath := args[0]
@@ -455,6 +533,13 @@ func installArchive(c config.Config, target, archivePath string, record state.Re
 		if old.Type != "dir" || newPaths[old.Path] {
 			continue
 		}
+		owned, err := state.OwnedByOthers(target, record.Pkgname, old.Path)
+		if err != nil {
+			return err
+		}
+		if owned {
+			continue
+		}
 		path, err := rootfs.TargetPath(target, old.Path)
 		if err == nil {
 			_ = os.Remove(path)
@@ -538,7 +623,17 @@ func cmdRemove(c config.Config, args []string, allowHost, force, dryRun bool, st
 		for _, record := range records {
 			for _, dep := range record.Depends {
 				fields := strings.Fields(dep)
-				if len(fields) > 0 && strings.TrimSpace(fields[0]) == args[0] {
+				if len(fields) == 0 {
+					continue
+				}
+				depName := strings.TrimSpace(fields[0])
+				for _, op := range []string{">=", "<=", ">", "<", "="} {
+					if i := strings.Index(depName, op); i >= 0 {
+						depName = depName[:i]
+						break
+					}
+				}
+				if depName == args[0] {
 					dependents = append(dependents, record.Pkgname)
 					break
 				}

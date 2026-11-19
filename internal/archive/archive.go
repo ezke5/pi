@@ -53,7 +53,7 @@ func safeSymlinkTarget(root, symlinkPath, target string) (string, error) {
 	return target, nil
 }
 
-func Create(pkgDir, output, pkgname, pkgver, pkgrel string, entries []footprint.Entry) error {
+func Create(pkgDir, output, pkgname, pkgver, pkgrel string, entries []footprint.Entry, backupLists ...[]string) error {
 	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil {
 		return fmt.Errorf("create package cache directory: %w", err)
 	}
@@ -65,6 +65,11 @@ func Create(pkgDir, output, pkgname, pkgver, pkgrel string, entries []footprint.
 	defer os.Remove(tarName)
 	tw := tar.NewWriter(tarFile)
 	metadata := fmt.Sprintf("pkgname = %s\npkgver = %s\npkgrel = %s\n", pkgname, pkgver, pkgrel)
+	if len(backupLists) > 0 {
+		for _, backup := range backupLists[0] {
+			metadata += fmt.Sprintf("backup = %s\n", backup)
+		}
+	}
 	hdr := &tar.Header{Name: ".PKGINFO", Mode: 0o644, Size: int64(len(metadata)), Typeflag: tar.TypeReg}
 	if err := tw.WriteHeader(hdr); err != nil {
 		return fmt.Errorf("write .PKGINFO header: %w", err)
@@ -167,6 +172,9 @@ func Extract(output string, archivePath, destRoot string) error {
 		if name == "." || name == "" {
 			continue
 		}
+		if filepath.ToSlash(name) == ".PKGINFO" {
+			continue
+		}
 		if filepath.IsAbs(name) || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
 			return fmt.Errorf("unsafe path %q in package archive %q", hdr.Name, archivePath)
 		}
@@ -267,4 +275,71 @@ func Entries(archivePath string) ([]footprint.Entry, error) {
 		}
 		entries = append(entries, entry)
 	}
+}
+
+type Info struct {
+	Pkgname string
+	Pkgver  string
+	Pkgrel  string
+	Backup  []string
+	Depends []string
+}
+
+// ReadInfo reads package identity fields from a .PKGINFO archive member.
+func ReadInfo(archivePath string) (Info, error) {
+	temp, err := os.CreateTemp(filepath.Dir(archivePath), ".pi-info-*.tar")
+	if err != nil {
+		return Info{}, err
+	}
+	tempName := temp.Name()
+	if err := temp.Close(); err != nil {
+		return Info{}, err
+	}
+	defer os.Remove(tempName)
+	if out, err := exec.Command("zstd", "-q", "-d", "-f", "-o", tempName, archivePath).CombinedOutput(); err != nil {
+		return Info{}, fmt.Errorf("decompress package archive %q: %w (%s)", archivePath, err, strings.TrimSpace(string(out)))
+	}
+	f, err := os.Open(tempName)
+	if err != nil {
+		return Info{}, err
+	}
+	defer f.Close()
+	tr := tar.NewReader(f)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return Info{}, err
+		}
+		if hdr.Name != ".PKGINFO" {
+			continue
+		}
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			return Info{}, err
+		}
+		info := Info{}
+		for _, line := range strings.Split(string(data), "\n") {
+			key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+			if !ok {
+				continue
+			}
+			switch strings.TrimSpace(key) {
+			case "pkgname":
+				info.Pkgname = strings.Trim(strings.TrimSpace(value), `"'`)
+			case "pkgver":
+				info.Pkgver = strings.Trim(strings.TrimSpace(value), `"'`)
+			case "pkgrel":
+				info.Pkgrel = strings.Trim(strings.TrimSpace(value), `"'`)
+			case "backup":
+				info.Backup = append(info.Backup, strings.Trim(strings.TrimSpace(value), `"'`))
+			case "depends":
+				info.Depends = append(info.Depends, strings.Trim(strings.TrimSpace(value), `"'`))
+			}
+		}
+		return info, nil
+	}
+	return Info{}, fmt.Errorf("package archive %q has no .PKGINFO", archivePath)
 }
