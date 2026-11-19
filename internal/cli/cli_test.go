@@ -10,6 +10,7 @@ import (
 
 	"github.com/ezke5/pi/internal/archive"
 	"github.com/ezke5/pi/internal/footprint"
+	"github.com/ezke5/pi/internal/pkgbuild"
 	"github.com/ezke5/pi/internal/state"
 )
 
@@ -159,6 +160,28 @@ func TestInstallPackageNameResolvesNewestCachedArchive(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "demo-2.0-1.pkg.tar.zst") {
 		t.Fatalf("did not select newest archive: %s", output.String())
+	}
+}
+
+func TestSelectInstallArchivePrefersBinaryAndFallsBackToRecipeArchive(t *testing.T) {
+	cache := t.TempDir()
+	recipe := pkgbuild.Recipe{Pkgname: "demo", Pkgver: "2.0", Pkgrel: "1"}
+	if path, source := selectInstallArchive(cache, recipe); path != filepath.Join(cache, recipe.ArchiveName()) || source != "build from PKGBUILD" {
+		t.Fatalf("missing archive selection = %q, %q", path, source)
+	}
+	older := filepath.Join(cache, "demo-1.0-1.pkg.tar.zst")
+	if err := os.WriteFile(older, []byte("archive"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if path, source := selectInstallArchive(cache, recipe); path != older || source != "existing archive" {
+		t.Fatalf("fallback archive selection = %q, %q", path, source)
+	}
+	exact := filepath.Join(cache, recipe.ArchiveName())
+	if err := os.WriteFile(exact, []byte("archive"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if path, source := selectInstallArchive(cache, recipe); path != exact || source != "existing archive" {
+		t.Fatalf("exact archive selection = %q, %q", path, source)
 	}
 }
 

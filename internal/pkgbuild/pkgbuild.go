@@ -28,6 +28,7 @@ type Recipe struct {
 
 var scalarRE = regexp.MustCompile(`^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$`)
 var heredocRE = regexp.MustCompile(`<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)`)
+var recipeVariableRE = regexp.MustCompile(`\$\{(pkgname|pkgver|pkgrel)\}|\$(pkgname|pkgver|pkgrel)\b`)
 
 func splitShellWords(value string) []string {
 	value = strings.TrimSpace(value)
@@ -159,7 +160,27 @@ func Read(path string) (Recipe, error) {
 	if len(recipe.Source) != len(recipe.SHA256Sums) && len(recipe.SHA256Sums) != 0 {
 		return Recipe{}, fmt.Errorf("PKGBUILD %q: source count (%d) differs from sha256sums count (%d)", path, len(recipe.Source), len(recipe.SHA256Sums))
 	}
+	recipe.Source = expandRecipeVariables(recipe.Source, recipe)
 	return recipe, nil
+}
+
+func expandRecipeVariables(sources []string, recipe Recipe) []string {
+	values := map[string]string{
+		"pkgname": recipe.Pkgname,
+		"pkgver":  recipe.Pkgver,
+		"pkgrel":  recipe.Pkgrel,
+	}
+	expanded := make([]string, len(sources))
+	for i, source := range sources {
+		expanded[i] = recipeVariableRE.ReplaceAllStringFunc(source, func(variable string) string {
+			name := strings.TrimPrefix(strings.TrimSuffix(variable, "}"), "${")
+			if !strings.HasPrefix(variable, "${") {
+				name = strings.TrimPrefix(variable, "$")
+			}
+			return values[name]
+		})
+	}
+	return expanded
 }
 
 func setArray(recipe *Recipe, name, value string) {
