@@ -22,8 +22,9 @@ bin/pi-index --packages ./pkg --index ./pkg/index.json \
 ```
 
 `pi-index` reports warnings for empty package directories and filenames that do
-not match `<pkgname>-<pkgver>-<pkgrel>.pkg.tar.zst`; existing index entries are
-preserved in those cases. Package inspection and extraction explicitly require
+not match `<pkgname>-<pkgver>-<pkgrel>.pkg.tar.zst` or
+`<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.zst`; existing index entries are
+preserved in those cases. Package names containing hyphens are supported. Package inspection and extraction explicitly require
 zstd-compressed archives and explain when a gzip or other format is being
 used with a `.pkg.tar.zst` name.
 

@@ -39,3 +39,32 @@ func TestSaveAndLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestParseFilenameNamingConventions(t *testing.T) {
+	tests := []struct {
+		filename             string
+		hint                 string
+		name, ver, rel, arch string
+	}{
+		{"hello-1.0.0-1-x86_64.pkg.tar.zst", "", "hello", "1.0.0", "1", "x86_64"},
+		{"hello-1.0.0-1.pkg.tar.zst", "aarch64", "hello", "1.0.0", "1", "aarch64"},
+		{"foo-bar-1.0.0-1-aarch64.pkg.tar.zst", "", "foo-bar", "1.0.0", "1", "aarch64"},
+		{"foo-bar-1.0.0-1.pkg.tar.zst", "", "foo-bar", "1.0.0", "1", ""},
+	}
+	for _, tt := range tests {
+		name, ver, rel, arch, ok := ParseFilename(tt.filename, tt.hint)
+		if !ok || name != tt.name || ver != tt.ver || rel != tt.rel || arch != tt.arch {
+			t.Fatalf("parse %q = %q %q %q %q %v", tt.filename, name, ver, rel, arch, ok)
+		}
+	}
+}
+
+func TestMergeTreatsNoArchAndArchHintAsSameVersion(t *testing.T) {
+	index := New()
+	Merge(&index, Entry{Pkgname: "hello", Pkgver: "1.0.0", Pkgrel: "1", Arch: "", Filename: "hello-1.0.0-1.pkg.tar.zst"})
+	Merge(&index, Entry{Pkgname: "hello", Pkgver: "1.0.0", Pkgrel: "1", Arch: "x86_64", Filename: "hello-1.0.0-1-x86_64.pkg.tar.zst"})
+	group := index.Packages["hello"]
+	if len(group.Versions) != 1 || group.Latest != "1.0.0-1" || group.Versions[0].Arch != "x86_64" {
+		t.Fatalf("incremental architecture merge = %+v", group)
+	}
+}

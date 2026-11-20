@@ -414,7 +414,7 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse,
 	}
 	var index repoindex.Index
 	indexLoaded := false
-	if !sourceBuild && !dryRun && c.Index != "" {
+	if !sourceBuild && c.Index != "" {
 		loaded, loadErr := binary.LoadIndex(c.Index)
 		if loadErr == nil {
 			index, indexLoaded = loaded, true
@@ -443,12 +443,23 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse,
 		archivePath, source := selectInstallArchive(c.Binpkgs, r)
 		var binaryEntry repoindex.Entry
 		if indexLoaded {
-			_, indexed := repoindex.Find(index, r.Pkgname, c.Arch)
-			if path, entry, resolveErr := binary.Resolve(index, r.Pkgname, c.Arch, c.Binpkgs, stdout); resolveErr == nil {
-				archivePath, binaryEntry, source = path, entry, "repository binary"
-			} else if indexed {
-				archivePath, source = filepath.Join(c.Binpkgs, r.ArchiveName()), "build from PKGBUILD"
-				fmt.Fprintf(stdout, "binary unavailable for %s; falling back to PKGBUILD: %v\n", r.Pkgname, resolveErr)
+			if entry, ok := repoindex.Find(index, r.Pkgname, c.Arch); ok {
+				cachedPath := filepath.Join(c.Binpkgs, entry.Filename)
+				if verifyErr := repoindex.Verify(cachedPath, entry.SHA256); verifyErr == nil {
+					archivePath, binaryEntry, source = cachedPath, entry, "repository binary"
+				} else {
+					if dryRun {
+						archivePath, source = filepath.Join(c.Binpkgs, r.ArchiveName()), "build from PKGBUILD"
+						fmt.Fprintf(stdout, "binary unavailable in cache for %s; dry-run would fall back to PKGBUILD\n", r.Pkgname)
+					} else {
+						if resolvedPath, resolvedEntry, resolveErr := binary.Resolve(index, r.Pkgname, c.Arch, c.Binpkgs, stdout); resolveErr == nil {
+							archivePath, binaryEntry, source = resolvedPath, resolvedEntry, "repository binary"
+						} else {
+							archivePath, source = filepath.Join(c.Binpkgs, r.ArchiveName()), "build from PKGBUILD"
+							fmt.Fprintf(stdout, "binary unavailable for %s; falling back to PKGBUILD: %v\n", r.Pkgname, resolveErr)
+						}
+					}
+				}
 			}
 		}
 		record, _ := state.Load(target, r.Pkgname)

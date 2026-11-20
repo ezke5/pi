@@ -57,6 +57,37 @@ func TestRunIndexGeneratesAndMergesArchives(t *testing.T) {
 	}
 }
 
+func TestRunIndexHandlesArchAndHyphenatedNames(t *testing.T) {
+	root := t.TempDir()
+	packages := filepath.Join(root, "packages")
+	if err := os.MkdirAll(packages, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, filename := range []string{
+		"hello-1.0.0-1-x86_64.pkg.tar.zst",
+		"foo-bar-1.0.0-1.pkg.tar.zst",
+	} {
+		if err := os.WriteFile(filepath.Join(packages, filename), []byte(filename), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	indexPath := filepath.Join(root, "index.json")
+	var warnings bytes.Buffer
+	if err := runIndex(indexPath, packages, "https://example.test/rolling", "x86_64", &warnings); err != nil {
+		t.Fatal(err)
+	}
+	index, err := repoindex.Load(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if group, ok := index.Packages["hello"]; !ok || len(group.Versions) != 1 || group.Versions[0].Pkgver != "1.0.0" || group.Versions[0].Pkgrel != "1" || group.Versions[0].Arch != "x86_64" {
+		t.Fatalf("hello index entry = %+v, ok=%v", group, ok)
+	}
+	if group, ok := index.Packages["foo-bar"]; !ok || len(group.Versions) != 1 || group.Latest != "1.0.0-1" {
+		t.Fatalf("hyphenated index entry = %+v, ok=%v", group, ok)
+	}
+}
+
 func TestRunIndexWarnsForEmptyAndMalformedDirectories(t *testing.T) {
 	root := t.TempDir()
 	indexPath := filepath.Join(root, "index.json")
@@ -86,5 +117,24 @@ func TestRunIndexWarnsForEmptyAndMalformedDirectories(t *testing.T) {
 func TestValidateBaseURL(t *testing.T) {
 	if err := validateBaseURL("file:///tmp/packages"); err == nil || !strings.Contains(err.Error(), "only http and https") {
 		t.Fatalf("unexpected file URL error: %v", err)
+	}
+}
+
+func TestParseArchiveNamingConventions(t *testing.T) {
+	tests := []struct {
+		filename             string
+		hint                 string
+		name, ver, rel, arch string
+	}{
+		{"hello-1.0.0-1-x86_64.pkg.tar.zst", "", "hello", "1.0.0", "1", "x86_64"},
+		{"hello-1.0.0-1.pkg.tar.zst", "x86_64", "hello", "1.0.0", "1", "x86_64"},
+		{"foo-bar-1.0.0-1-x86_64.pkg.tar.zst", "", "foo-bar", "1.0.0", "1", "x86_64"},
+		{"foo-bar-1.0.0-1.pkg.tar.zst", "", "foo-bar", "1.0.0", "1", ""},
+	}
+	for _, tt := range tests {
+		name, ver, rel, arch, ok := parseArchive(tt.filename, tt.hint)
+		if !ok || name != tt.name || ver != tt.ver || rel != tt.rel || arch != tt.arch {
+			t.Fatalf("parse %q = %q %q %q %q %v", tt.filename, name, ver, rel, arch, ok)
+		}
 	}
 }

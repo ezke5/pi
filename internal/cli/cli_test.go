@@ -243,6 +243,49 @@ package() {
 	}
 }
 
+func TestInstallFindsArchNamedIndexedBinary(t *testing.T) {
+	root := t.TempDir()
+	ports := filepath.Join(root, "ports")
+	recipeDir := filepath.Join(ports, "hello")
+	cache := filepath.Join(root, "cache")
+	target := filepath.Join(root, "target")
+	for _, dir := range []string{recipeDir, cache} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(recipeDir, "PKGBUILD"), []byte("pkgname=hello\npkgver=1.0.0\npkgrel=1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	archivePath := filepath.Join(cache, "hello-1.0.0-1-x86_64.pkg.tar.zst")
+	if err := os.WriteFile(archivePath, []byte("indexed archive"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := repoindex.SHA256(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexPath := filepath.Join(root, "index.json")
+	index := repoindex.New()
+	repoindex.Merge(&index, repoindex.Entry{
+		Pkgname: "hello", Pkgver: "1.0.0", Pkgrel: "1", Arch: "x86_64",
+		Filename: filepath.Base(archivePath), SHA256: sum,
+	})
+	if err := repoindex.Save(indexPath, index); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := Run([]string{
+		"--ports", ports, "--cache", cache, "--root", target,
+		"--index", indexPath, "--arch", "x86_64", "--dry-run", "install", "hello",
+	}, &output, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "repository binary") || strings.Contains(output.String(), "build from PKGBUILD") {
+		t.Fatalf("arch binary was not selected: %s", output.String())
+	}
+}
+
 func TestUpgradeRemovesOrphanPreservesBackupAndAvoidsSelfConflict(t *testing.T) {
 	if _, err := exec.LookPath("zstd"); err != nil {
 		t.Skip("zstd is required for package archive creation")

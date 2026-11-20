@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/ezke5/pi/internal/archive"
 	"github.com/ezke5/pi/internal/repoindex"
 )
 
@@ -52,9 +53,9 @@ func runIndex(indexPath, packages, baseURL, arch string, stderr io.Writer) error
 	}
 	seen := 0
 	for _, path := range paths {
-		name, ver, rel, ok := parseArchive(filepath.Base(path))
+		name, ver, rel, parsedArch, ok := parseArchive(filepath.Base(path), arch)
 		if !ok {
-			fmt.Fprintf(stderr, "warning: ignoring archive with unexpected filename %q; expected <pkgname>-<pkgver>-<pkgrel>.pkg.tar.zst\n", filepath.Base(path))
+			fmt.Fprintf(stderr, "warning: ignoring archive with unexpected filename %q; expected <pkgname>-<pkgver>-<pkgrel>[-<arch>].pkg.tar.zst\n", filepath.Base(path))
 			continue
 		}
 		info, err := os.Stat(path)
@@ -71,8 +72,22 @@ func runIndex(indexPath, packages, baseURL, arch string, stderr io.Writer) error
 			fmt.Fprintf(stderr, "warning: cannot hash %q: %v\n", path, err)
 			continue
 		}
+		if info, metadataErr := archive.ReadInfo(path); metadataErr == nil {
+			if info.Pkgname != "" {
+				name = info.Pkgname
+			}
+			if info.Pkgver != "" {
+				ver = info.Pkgver
+			}
+			if info.Pkgrel != "" {
+				rel = info.Pkgrel
+			}
+		}
+		if parsedArch == "" {
+			parsedArch = arch
+		}
 		repoindex.Merge(&index, repoindex.Entry{
-			Pkgname: name, Pkgver: ver, Pkgrel: rel, Arch: arch,
+			Pkgname: name, Pkgver: ver, Pkgrel: rel, Arch: parsedArch,
 			Filename: filepath.Base(path), URL: binaryURL(baseURL, filepath.Base(path)),
 			SHA256: sum, Size: info.Size(),
 		})
@@ -96,16 +111,8 @@ func defaultArch() string {
 	return runtime.GOARCH
 }
 
-func parseArchive(filename string) (string, string, string, bool) {
-	base := strings.TrimSuffix(filename, ".pkg.tar.zst")
-	parts := strings.Split(base, "-")
-	if len(parts) < 3 {
-		return "", "", "", false
-	}
-	rel := parts[len(parts)-1]
-	ver := parts[len(parts)-2]
-	name := strings.Join(parts[:len(parts)-2], "-")
-	return name, ver, rel, name != ""
+func parseArchive(filename, archHint string) (string, string, string, string, bool) {
+	return repoindex.ParseFilename(filename, archHint)
 }
 
 func binaryURL(base, filename string) string {

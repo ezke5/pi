@@ -102,7 +102,11 @@ func Merge(index *Index, entries ...Entry) {
 		group := index.Packages[entry.Pkgname]
 		replaced := false
 		for i, old := range group.Versions {
-			if old.Pkgver == entry.Pkgver && old.Pkgrel == entry.Pkgrel && old.Arch == entry.Arch {
+			sameArch := old.Arch == entry.Arch || old.Arch == "" || entry.Arch == ""
+			if old.Pkgver == entry.Pkgver && old.Pkgrel == entry.Pkgrel && sameArch {
+				if entry.Arch == "" {
+					entry.Arch = old.Arch
+				}
 				group.Versions[i] = entry
 				replaced = true
 				break
@@ -133,6 +137,56 @@ func Find(index Index, name, arch string) (Entry, bool) {
 		}
 	}
 	return Entry{}, false
+}
+
+// ParseFilename parses both supported package archive naming conventions.
+// Supported forms are <pkgname>-<pkgver>-<pkgrel>.pkg.tar.zst and
+// <pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.zst.
+func ParseFilename(filename, archHint string) (pkgname, pkgver, pkgrel, arch string, ok bool) {
+	if !strings.HasSuffix(filename, ".pkg.tar.zst") {
+		return "", "", "", "", false
+	}
+	base := strings.TrimSuffix(filename, ".pkg.tar.zst")
+	parts := strings.Split(base, "-")
+	if len(parts) < 3 {
+		return "", "", "", "", false
+	}
+
+	arch = archHint
+	last := parts[len(parts)-1]
+	if archHint != "" && last == archHint {
+		parts = parts[:len(parts)-1]
+	} else if LooksLikeArch(last) {
+		arch = last
+		parts = parts[:len(parts)-1]
+	}
+	if len(parts) < 3 {
+		return "", "", "", "", false
+	}
+	pkgrel = parts[len(parts)-1]
+	pkgver = parts[len(parts)-2]
+	pkgname = strings.Join(parts[:len(parts)-2], "-")
+	if pkgname == "" || pkgver == "" || pkgrel == "" {
+		return "", "", "", "", false
+	}
+	return pkgname, pkgver, pkgrel, arch, true
+}
+
+func LooksLikeArch(value string) bool {
+	switch value {
+	case "any", "amd64", "x86_64", "i686", "i586", "i486", "aarch64", "arm64",
+		"armv7h", "armv7l", "armv6h", "riscv64", "loong64", "wasm32", "s390x", "ppc64le", "ppc64":
+		return true
+	}
+	if strings.Contains(value, "_") {
+		return true
+	}
+	for _, prefix := range []string{"arm", "riscv", "mips", "ppc", "s390"} {
+		if strings.HasPrefix(value, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func SHA256(path string) (string, error) {
