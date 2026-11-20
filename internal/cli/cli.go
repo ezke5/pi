@@ -38,6 +38,7 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	configPath := fs.String("config", "", "INI configuration file")
 	allowHost := fs.Bool("allow-host-root", false, "explicitly allow operating on /")
 	force := fs.Bool("force", false, "override dependency safety checks")
+	rebuild := fs.Bool("rebuild", false, "rebuild and reinstall even when matching version and USE state are already installed")
 	dryRun := fs.Bool("dry-run", false, "show operations without changing the target")
 	reuse := fs.Bool("reuse", true, "reuse cached sources")
 	sourceBuild := fs.Bool("source-build", false, "always build from PKGBUILD instead of using binaries")
@@ -88,12 +89,16 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		return nil
 	case "init":
 		return cmdInit(c, *configPath, pos[1:], stdout)
+	case "bootstrap":
+		return cmdBootstrap(c, *allowHost, *dryRun, stdout)
+	case "chroot":
+		return cmdChroot(c, pos[1:], *dryRun, os.Stdin, stdout, stderr)
 	case "info", "inspect":
 		return cmdInfo(c, pos[1:], stdout)
 	case "build":
-		return cmdBuild(c, pos[1:], *reuse, *dryRun, stdout)
+		return cmdBuild(c, pos[1:], *reuse, *rebuild, *dryRun, stdout)
 	case "install":
-		return cmdInstall(c, pos[1:], *allowHost, *force, *dryRun, *reuse, *sourceBuild, stdout)
+		return cmdInstall(c, pos[1:], *allowHost, *force, *rebuild, *dryRun, *reuse, *sourceBuild, stdout)
 	case "remove":
 		return cmdRemove(c, pos[1:], *allowHost, *force, *dryRun, stdout)
 	case "list":
@@ -111,19 +116,30 @@ func splitFlags(args []string) ([]string, []string) {
 	}
 	boolFlags := map[string]bool{
 		"--allow-host-root": true, "--dry-run": true, "--reuse": true, "--force": true,
-		"--source-build": true,
+		"--rebuild": true, "--source-build": true,
 	}
 	global := []string{}
 	rest := []string{}
+	seenChroot := false
+	inChrootCmd := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
+		if inChrootCmd {
+			rest = append(rest, arg)
+			continue
+		}
+		if arg == "--" {
+			inChrootCmd = true
+			rest = append(rest, arg)
+			continue
+		}
 		matched := false
 		for flagName := range valueFlags {
 			if arg == flagName || strings.HasPrefix(arg, flagName+"=") {
 				global = append(global, arg)
 				if arg == flagName && i+1 < len(args) {
 					next := args[i+1]
-					isSubcommand := next == "init" || next == "info" || next == "inspect" || next == "build" || next == "install" || next == "remove" || next == "list" || next == "help"
+					isSubcommand := next == "init" || next == "bootstrap" || next == "chroot" || next == "info" || next == "inspect" || next == "build" || next == "install" || next == "remove" || next == "list" || next == "help"
 					if !strings.HasPrefix(next, "--") && !isSubcommand {
 						i++
 						global = append(global, next)
@@ -144,6 +160,11 @@ func splitFlags(args []string) ([]string, []string) {
 		}
 		if !matched {
 			rest = append(rest, arg)
+			if arg == "chroot" && !seenChroot {
+				seenChroot = true
+			} else if seenChroot {
+				inChrootCmd = true
+			}
 		}
 	}
 	return global, rest
@@ -154,6 +175,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Commands:")
 	fmt.Fprintln(w, "  init [dir]                 Create recommended directory and config layout")
+	fmt.Fprintln(w, "  bootstrap                  Create minimal FHS skeleton in target root")
+	fmt.Fprintln(w, "  chroot [CMD...]            Mount virtual filesystems and chroot into target root")
 	fmt.Fprintln(w, "  info|inspect <PKGBUILD>    Inspect a package recipe")
 	fmt.Fprintln(w, "  build <PKGBUILD|name>      Build and package a recipe")
 	fmt.Fprintln(w, "  install <package|name>     Install a .pkg.tar.zst archive")
@@ -162,7 +185,42 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Global flags:")
 	fmt.Fprintln(w, "  --root, --ports, --work, --temp, --cache, --config, --index, --repo-url, --arch")
-	fmt.Fprintln(w, "  --dry-run, --allow-host-root, --force, --source-build")
+	fmt.Fprintln(w, "  --dry-run, --allow-host-root, --force, --rebuild, --source-build")
+}
+
+func cmdBootstrap(c config.Config, allowHost, dryRun bool, stdout io.Writer) error {
+	target, err := rootfs.Validate(c.Root, allowHost)
+	if err != nil {
+		return err
+	}
+	if dryRun {
+		fmt.Fprintf(stdout, "dry-run: bootstrap rootfs skeleton at %s\n", target)
+		return nil
+	}
+	if err := rootfs.Bootstrap(target); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "bootstrapped rootfs at %s\n", target)
+	return nil
+}
+
+func cmdChroot(c config.Config, args []string, dryRun bool, stdin io.Reader, stdout, stderr io.Writer) error {
+	target, err := rootfs.Validate(c.Root, false)
+	if err != nil {
+		return err
+	}
+	if len(args) > 0 && args[0] == "--" {
+		args = args[1:]
+	}
+	if dryRun {
+		cmd := args
+		if len(cmd) == 0 {
+			cmd = rootfs.DefaultChrootCommand(target)
+		}
+		fmt.Fprintf(stdout, "dry-run: chroot %s (%s)\n", target, strings.Join(cmd, " "))
+		return nil
+	}
+	return rootfs.Chroot(target, args, stdin, stdout, stderr)
 }
 
 func cmdInit(c config.Config, configPath string, args []string, stdout io.Writer) error {
@@ -226,7 +284,7 @@ func buildConfigSource(c config.Config) string {
 	return "defaults"
 }
 
-func cmdBuild(c config.Config, args []string, reuse bool, dryRun bool, stdout io.Writer) error {
+func cmdBuild(c config.Config, args []string, reuse, rebuild, dryRun bool, stdout io.Writer) error {
 	if len(args) == 0 {
 		return fmt.Errorf("build requires a PKGBUILD path or package name")
 	}
@@ -234,16 +292,27 @@ func cmdBuild(c config.Config, args []string, reuse bool, dryRun bool, stdout io
 	if err != nil {
 		return err
 	}
-	for i, r := range graph.Recipes() {
+	recipes := graph.Recipes()
+	toBuild := make([]pkgbuild.Recipe, 0, len(recipes))
+	for i, r := range recipes {
+		useState := c.ResolveUSE(r.Pkgname)
+		if !rebuild && c.Root != "" {
+			if ok, _ := state.VerifyInstalled(c.Root, r.Pkgname, r.Pkgver, r.Pkgrel, useState.Hash); ok {
+				fmt.Fprintf(stdout, "%d. %s-%s-%s (skipping: already installed with matching USE hash %s; use --rebuild to force)\n",
+					i+1, r.Pkgname, r.Pkgver, r.Pkgrel, useState.Hash)
+				continue
+			}
+		}
 		fmt.Fprintf(stdout, "%d. %s-%s-%s (build from PKGBUILD)\n", i+1, r.Pkgname, r.Pkgver, r.Pkgrel)
+		toBuild = append(toBuild, r)
 	}
-	if dryRun {
+	if dryRun || len(toBuild) == 0 {
 		return nil
 	}
 	if err := c.EnsureDirs(); err != nil {
 		return err
 	}
-	for _, r := range graph.Recipes() {
+	for _, r := range toBuild {
 		if err := cmdBuildRecipe(c, r, reuse, stdout); err != nil {
 			return err
 		}
@@ -373,7 +442,7 @@ func copyFile(src, dest string) error {
 	return out.Close()
 }
 
-func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse, sourceBuild bool, stdout io.Writer) error {
+func cmdInstall(c config.Config, args []string, allowHost, force, rebuild, dryRun, reuse, sourceBuild bool, stdout io.Writer) error {
 	if len(args) == 0 {
 		return fmt.Errorf("install requires a .pkg.tar.zst archive or package name")
 	}
@@ -389,7 +458,17 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse,
 		info, infoErr := archive.ReadInfo(archivePath)
 		record := state.Record{}
 		if infoErr == nil {
-			record = state.Record{Pkgname: info.Pkgname, Pkgver: info.Pkgver, Pkgrel: info.Pkgrel, Backup: info.Backup, Depends: info.Depends}
+			record = state.Record{
+				Pkgname:     info.Pkgname,
+				Pkgver:      info.Pkgver,
+				Pkgrel:      info.Pkgrel,
+				Arch:        info.Arch,
+				USEFlags:    info.USEFlags,
+				USEDisabled: info.USEDisabled,
+				USEHash:     info.USEHash,
+				Backup:      info.Backup,
+				Depends:     info.Depends,
+			}
 			if info.USEHash != "" {
 				targetUSE := c.ResolveUSE(info.Pkgname)
 				if targetUSE.Hash != info.USEHash {
@@ -399,6 +478,13 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse,
 		} else {
 			base := strings.TrimSuffix(filepath.Base(archivePath), ".pkg.tar.zst")
 			record.Pkgname = base
+		}
+		if !rebuild && record.Pkgname != "" && record.Pkgver != "" {
+			if ok, _ := state.VerifyInstalled(target, record.Pkgname, record.Pkgver, record.Pkgrel, record.USEHash); ok {
+				fmt.Fprintf(stdout, "1. %s: already installed (%s-%s, use_hash=%s); skipping (use --rebuild to reinstall)\n",
+					filepath.Base(archivePath), record.Pkgver, record.Pkgrel, record.USEHash)
+				return nil
+			}
 		}
 		status := "new install"
 		if record.Pkgname != "" {
@@ -419,9 +505,26 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse,
 			info, infoErr := archive.ReadInfo(archivePath)
 			record := state.Record{Pkgname: args[0]}
 			if infoErr == nil {
-				record = state.Record{Pkgname: info.Pkgname, Pkgver: info.Pkgver, Pkgrel: info.Pkgrel, Backup: info.Backup, Depends: info.Depends}
+				record = state.Record{
+					Pkgname:     info.Pkgname,
+					Pkgver:      info.Pkgver,
+					Pkgrel:      info.Pkgrel,
+					Arch:        info.Arch,
+					USEFlags:    info.USEFlags,
+					USEDisabled: info.USEDisabled,
+					USEHash:     info.USEHash,
+					Backup:      info.Backup,
+					Depends:     info.Depends,
+				}
 				if info.USEHash != "" && c.ResolveUSE(record.Pkgname).Hash != info.USEHash {
 					return fmt.Errorf("package archive %q USE hash mismatch: archive %s, requested %s", archivePath, info.USEHash, c.ResolveUSE(record.Pkgname).Hash)
+				}
+			}
+			if !rebuild && record.Pkgname != "" && record.Pkgver != "" {
+				if ok, _ := state.VerifyInstalled(target, record.Pkgname, record.Pkgver, record.Pkgrel, record.USEHash); ok {
+					fmt.Fprintf(stdout, "1. %s: already installed (%s-%s, use_hash=%s); skipping (use --rebuild to reinstall)\n",
+						filepath.Base(archivePath), record.Pkgver, record.Pkgrel, record.USEHash)
+					return nil
 				}
 			}
 			status := "new install"
@@ -447,7 +550,24 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse,
 		info, infoErr := archive.ReadInfo(archivePath)
 		record := state.Record{Pkgname: args[0]}
 		if infoErr == nil {
-			record = state.Record{Pkgname: info.Pkgname, Pkgver: info.Pkgver, Pkgrel: info.Pkgrel, Backup: info.Backup, Depends: info.Depends}
+			record = state.Record{
+				Pkgname:     info.Pkgname,
+				Pkgver:      info.Pkgver,
+				Pkgrel:      info.Pkgrel,
+				Arch:        info.Arch,
+				USEFlags:    info.USEFlags,
+				USEDisabled: info.USEDisabled,
+				USEHash:     info.USEHash,
+				Backup:      info.Backup,
+				Depends:     info.Depends,
+			}
+		}
+		if !rebuild && record.Pkgname != "" && record.Pkgver != "" {
+			if ok, _ := state.VerifyInstalled(target, record.Pkgname, record.Pkgver, record.Pkgrel, record.USEHash); ok {
+				fmt.Fprintf(stdout, "1. %s: already installed (%s-%s, use_hash=%s); skipping (use --rebuild to reinstall)\n",
+					filepath.Base(archivePath), record.Pkgver, record.Pkgrel, record.USEHash)
+				return nil
+			}
 		}
 		fmt.Fprintf(stdout, "1. %s: new install; existing archive\n", filepath.Base(archivePath))
 		if dryRun {
@@ -464,7 +584,7 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse,
 	}
 	var index repoindex.Index
 	indexLoaded := false
-	if !sourceBuild && c.Index != "" {
+	if !sourceBuild && !rebuild && c.Index != "" {
 		loaded, loadErr := binary.LoadIndex(c.Index)
 		if loadErr == nil {
 			index, indexLoaded = loaded, true
@@ -472,7 +592,7 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse,
 			fmt.Fprintf(stdout, "repository index unavailable; using source/cache fallback: %v\n", loadErr)
 		}
 	}
-	if !sourceBuild && !dryRun && !indexLoaded && c.RepoURL != "" {
+	if !sourceBuild && !rebuild && !dryRun && !indexLoaded && c.RepoURL != "" {
 		indexURL := binary.NormalizeURL(c.RepoURL, "index.json")
 		temp, tempErr := os.CreateTemp("", "pi-index-*.json")
 		if tempErr == nil {
@@ -491,23 +611,42 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse,
 	for i, name := range graph.Order {
 		r := graph.Nodes[name].Recipe
 		useState := c.ResolveUSE(r.Pkgname)
-		archivePath, source := selectInstallArchiveForUSE(c.Binpkgs, r, c.Arch, useState.Hash)
+		version, release := r.Pkgver, r.Pkgrel
+		if !rebuild {
+			checkVer, checkRel := r.Pkgver, r.Pkgrel
+			if indexLoaded {
+				if entry, ok := repoindex.FindForUSE(index, r.Pkgname, c.Arch, useState.Hash); ok && entry.Pkgver != "" {
+					checkVer, checkRel = entry.Pkgver, entry.Pkgrel
+				}
+			}
+			if ok, _ := state.VerifyInstalled(target, r.Pkgname, checkVer, checkRel, useState.Hash); ok {
+				fmt.Fprintf(stdout, "%d. %s-%s-%s: already installed with matching USE hash %s; skipping (use --rebuild to reinstall)\n",
+					i+1, r.Pkgname, checkVer, checkRel, useState.Hash)
+				continue
+			}
+		}
+		var archivePath, source string
 		var binaryEntry repoindex.Entry
-		if indexLoaded {
-			if entry, ok := repoindex.FindForUSE(index, r.Pkgname, c.Arch, useState.Hash); ok {
-				cachedPath := filepath.Join(c.Binpkgs, entry.Filename)
-				if verifyErr := binary.VerifyUSE(cachedPath, entry, useState.Hash); verifyErr == nil {
-					archivePath, binaryEntry, source = cachedPath, entry, "repository binary"
-				} else {
-					if dryRun {
-						archivePath, source = filepath.Join(c.Binpkgs, r.ArchiveName()), "build from PKGBUILD"
-						fmt.Fprintf(stdout, "binary unavailable in cache for %s; dry-run would fall back to PKGBUILD\n", r.Pkgname)
+		if rebuild {
+			archivePath, source = filepath.Join(c.Binpkgs, r.ArchiveName()), "build from PKGBUILD"
+		} else {
+			archivePath, source = selectInstallArchiveForUSE(c.Binpkgs, r, c.Arch, useState.Hash)
+			if indexLoaded {
+				if entry, ok := repoindex.FindForUSE(index, r.Pkgname, c.Arch, useState.Hash); ok {
+					cachedPath := filepath.Join(c.Binpkgs, entry.Filename)
+					if verifyErr := binary.VerifyUSE(cachedPath, entry, useState.Hash); verifyErr == nil {
+						archivePath, binaryEntry, source = cachedPath, entry, "repository binary"
 					} else {
-						if resolvedPath, resolvedEntry, resolveErr := binary.ResolveForUSEWithTimeout(index, r.Pkgname, c.Arch, useState.Hash, c.Binpkgs, c.DownloadTimeout, stdout); resolveErr == nil {
-							archivePath, binaryEntry, source = resolvedPath, resolvedEntry, "repository binary"
-						} else {
+						if dryRun {
 							archivePath, source = filepath.Join(c.Binpkgs, r.ArchiveName()), "build from PKGBUILD"
-							fmt.Fprintf(stdout, "binary unavailable for %s; falling back to PKGBUILD: %v\n", r.Pkgname, resolveErr)
+							fmt.Fprintf(stdout, "binary unavailable in cache for %s; dry-run would fall back to PKGBUILD\n", r.Pkgname)
+						} else {
+							if resolvedPath, resolvedEntry, resolveErr := binary.ResolveForUSEWithTimeout(index, r.Pkgname, c.Arch, useState.Hash, c.Binpkgs, c.DownloadTimeout, stdout); resolveErr == nil {
+								archivePath, binaryEntry, source = resolvedPath, resolvedEntry, "repository binary"
+							} else {
+								archivePath, source = filepath.Join(c.Binpkgs, r.ArchiveName()), "build from PKGBUILD"
+								fmt.Fprintf(stdout, "binary unavailable for %s; falling back to PKGBUILD: %v\n", r.Pkgname, resolveErr)
+							}
 						}
 					}
 				}
@@ -518,7 +657,6 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse,
 		if record.Pkgname == r.Pkgname && record.Pkgver != "" {
 			status = fmt.Sprintf("already installed (%s-%s -> %s-%s)", record.Pkgver, record.Pkgrel, r.Pkgver, r.Pkgrel)
 		}
-		version, release := r.Pkgver, r.Pkgrel
 		if binaryEntry.Pkgver != "" {
 			version, release = binaryEntry.Pkgver, binaryEntry.Pkgrel
 		}
@@ -536,7 +674,18 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse,
 				return err
 			}
 		}
-		if err := installArchive(c, target, archivePath, state.Record{Pkgname: r.Pkgname, Pkgver: version, Pkgrel: release, Depends: append(r.Depends, r.MakeDepends...), Backup: r.Backup}, force, false, stdout); err != nil {
+		allDeps := append(append([]string(nil), r.Depends...), r.MakeDepends...)
+		if err := installArchive(c, target, archivePath, state.Record{
+			Pkgname:     r.Pkgname,
+			Pkgver:      version,
+			Pkgrel:      release,
+			Arch:        c.Arch,
+			USEFlags:    useState.Enabled,
+			USEDisabled: useState.Disabled,
+			USEHash:     useState.Hash,
+			Depends:     allDeps,
+			Backup:      r.Backup,
+		}, force, false, stdout); err != nil {
 			return err
 		}
 	}
@@ -566,6 +715,9 @@ func installArchive(c config.Config, target, archivePath string, record state.Re
 	if dryRun {
 		fmt.Fprintf(stdout, "dry-run: install %s into %s\n", archivePath, target)
 		return nil
+	}
+	if _, err := rootfs.EnsureSkeletonIfEmpty(target); err != nil {
+		return err
 	}
 	oldEntries, err := state.Footprint(target, record.Pkgname)
 	if err != nil {
