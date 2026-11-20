@@ -1,0 +1,55 @@
+name: Build and publish packages
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      package_dir:
+        description: Directory containing built .pkg.tar.zst files
+        required: false
+        default: pkg
+      packages:
+        description: Space-separated package names to build from ports
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build and test applications
+        run: make verify
+      - name: Install package archive tooling
+        run: sudo apt-get update && sudo apt-get install -y zstd
+      - name: Build requested packages
+        if: ${{ inputs.packages != '' }}
+        env:
+          PACKAGE_DIR: ${{ inputs.package_dir || 'pkg' }}
+          PACKAGES: ${{ inputs.packages }}
+        run: ./bin/pi --ports ports --work work --cache "$PACKAGE_DIR" build $PACKAGES
+      - name: Build package index
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_DIR: ${{ inputs.package_dir || 'pkg' }}
+        run: |
+          mkdir -p "$PACKAGE_DIR"
+          gh release download rolling --pattern index.json --dir "$PACKAGE_DIR" --clobber || true
+          ./bin/pi-index --packages "$PACKAGE_DIR" --index "$PACKAGE_DIR/index.json" \
+            --base-url "${{ github.server_url }}/${{ github.repository }}/releases/download/rolling"
+      - name: Publish rolling release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_DIR: ${{ inputs.package_dir || 'pkg' }}
+        run: |
+          gh release view rolling >/dev/null 2>&1 || \
+            gh release create rolling --title "Rolling packages" --notes "Automated binary package repository"
+          gh release upload rolling "$PACKAGE_DIR/index.json" "$PACKAGE_DIR"/*.pkg.tar.zst --clobber

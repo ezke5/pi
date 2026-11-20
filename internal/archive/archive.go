@@ -151,8 +151,8 @@ func Extract(output string, archivePath, destRoot string) error {
 	tempName := temp.Name()
 	temp.Close()
 	defer os.Remove(tempName)
-	if out, err := exec.Command("zstd", "-q", "-d", "-f", "-o", tempName, archivePath).CombinedOutput(); err != nil {
-		return fmt.Errorf("decompress package archive %q: %w (%s)", archivePath, err, strings.TrimSpace(string(out)))
+	if err := decompress(archivePath, tempName); err != nil {
+		return fmt.Errorf("extract package archive %q: %w", archivePath, err)
 	}
 	f, err := os.Open(tempName)
 	if err != nil {
@@ -242,8 +242,8 @@ func Entries(archivePath string) ([]footprint.Entry, error) {
 		return nil, err
 	}
 	defer os.Remove(tempName)
-	if out, err := exec.Command("zstd", "-q", "-d", "-f", "-o", tempName, archivePath).CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("decompress package archive %q: %w (%s)", archivePath, err, strings.TrimSpace(string(out)))
+	if err := decompress(archivePath, tempName); err != nil {
+		return nil, fmt.Errorf("inspect package archive %q: %w", archivePath, err)
 	}
 	f, err := os.Open(tempName)
 	if err != nil {
@@ -296,9 +296,10 @@ func ReadInfo(archivePath string) (Info, error) {
 		return Info{}, err
 	}
 	defer os.Remove(tempName)
-	if out, err := exec.Command("zstd", "-q", "-d", "-f", "-o", tempName, archivePath).CombinedOutput(); err != nil {
-		return Info{}, fmt.Errorf("decompress package archive %q: %w (%s)", archivePath, err, strings.TrimSpace(string(out)))
+	if err := decompress(archivePath, tempName); err != nil {
+		return Info{}, fmt.Errorf("read package metadata from %q: %w", archivePath, err)
 	}
+
 	f, err := os.Open(tempName)
 	if err != nil {
 		return Info{}, err
@@ -342,4 +343,16 @@ func ReadInfo(archivePath string) (Info, error) {
 		return info, nil
 	}
 	return Info{}, fmt.Errorf("package archive %q has no .PKGINFO", archivePath)
+}
+
+func decompress(archivePath, outputPath string) error {
+	out, err := exec.Command("zstd", "-q", "-d", "-f", "-o", outputPath, archivePath).CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	detail := strings.TrimSpace(string(out))
+	if detail == "" {
+		detail = err.Error()
+	}
+	return fmt.Errorf("invalid .pkg.tar.zst compression; expected a zstd-compressed package archive (do not use gzip with a .pkg.tar.zst extension): %s", detail)
 }

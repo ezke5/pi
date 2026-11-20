@@ -11,6 +11,7 @@ import (
 	"github.com/ezke5/pi/internal/archive"
 	"github.com/ezke5/pi/internal/footprint"
 	"github.com/ezke5/pi/internal/pkgbuild"
+	"github.com/ezke5/pi/internal/repoindex"
 	"github.com/ezke5/pi/internal/state"
 )
 
@@ -182,6 +183,106 @@ func TestSelectInstallArchivePrefersBinaryAndFallsBackToRecipeArchive(t *testing
 	}
 	if path, source := selectInstallArchive(cache, recipe); path != exact || source != "existing archive" {
 		t.Fatalf("exact archive selection = %q, %q", path, source)
+	}
+}
+
+func TestIndexedChecksumMismatchFallsBackToPKGBUILD(t *testing.T) {
+	if _, err := exec.LookPath("zstd"); err != nil {
+		t.Skip("zstd is required for package archive creation")
+	}
+	root := t.TempDir()
+	ports := filepath.Join(root, "ports")
+	recipeDir := filepath.Join(ports, "demo")
+	cache := filepath.Join(root, "cache")
+	work := filepath.Join(root, "work")
+	target := filepath.Join(root, "target")
+	indexPath := filepath.Join(root, "index.json")
+	for _, dir := range []string{recipeDir, cache, work} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(recipeDir, "PKGBUILD"), []byte(`pkgname=demo
+pkgver=1
+pkgrel=1
+package() {
+  mkdir -p "$pkgdir/usr/share"
+  printf source-built > "$pkgdir/usr/share/demo"
+}
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	binaryPath := filepath.Join(cache, "demo-1-1.pkg.tar.zst")
+	if err := os.WriteFile(binaryPath, []byte("corrupt binary"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	index := repoindex.New()
+	repoindex.Merge(&index, repoindex.Entry{
+		Pkgname: "demo", Pkgver: "1", Pkgrel: "1", Arch: "x86_64",
+		Filename: filepath.Base(binaryPath), SHA256: "not-the-cache-hash",
+	})
+	if err := repoindex.Save(indexPath, index); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := Run([]string{
+		"--ports", ports, "--work", work, "--cache", cache, "--root", target,
+		"--index", indexPath, "install", "demo",
+	}, &output, &output); err != nil {
+		t.Fatalf("install fallback failed: %v\n%s", err, output.String())
+	}
+	if !strings.Contains(output.String(), "build from PKGBUILD") {
+		t.Fatalf("missing source fallback output: %s", output.String())
+	}
+	data, err := os.ReadFile(filepath.Join(target, "usr/share/demo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "source-built" {
+		t.Fatalf("unexpected installed content: %q", data)
+	}
+}
+
+func TestInstallFindsArchNamedIndexedBinary(t *testing.T) {
+	root := t.TempDir()
+	ports := filepath.Join(root, "ports")
+	recipeDir := filepath.Join(ports, "hello")
+	cache := filepath.Join(root, "cache")
+	target := filepath.Join(root, "target")
+	for _, dir := range []string{recipeDir, cache} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(recipeDir, "PKGBUILD"), []byte("pkgname=hello\npkgver=1.0.0\npkgrel=1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	archivePath := filepath.Join(cache, "hello-1.0.0-1-x86_64.pkg.tar.zst")
+	if err := os.WriteFile(archivePath, []byte("indexed archive"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := repoindex.SHA256(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexPath := filepath.Join(root, "index.json")
+	index := repoindex.New()
+	repoindex.Merge(&index, repoindex.Entry{
+		Pkgname: "hello", Pkgver: "1.0.0", Pkgrel: "1", Arch: "x86_64",
+		Filename: filepath.Base(archivePath), SHA256: sum,
+	})
+	if err := repoindex.Save(indexPath, index); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := Run([]string{
+		"--ports", ports, "--cache", cache, "--root", target,
+		"--index", indexPath, "--arch", "x86_64", "--dry-run", "install", "hello",
+	}, &output, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "repository binary") || strings.Contains(output.String(), "build from PKGBUILD") {
+		t.Fatalf("arch binary was not selected: %s", output.String())
 	}
 }
 

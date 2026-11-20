@@ -15,6 +15,9 @@ type Config struct {
 	Temp    string `ini:"temp"`
 	Cache   string `ini:"cache"`
 	Binpkgs string `ini:"binpkgs"`
+	Index   string `ini:"index"`
+	RepoURL string `ini:"repo_url"`
+	Arch    string `ini:"arch"`
 	Root    string `ini:"root"`
 	Config  string `ini:"-"`
 }
@@ -30,6 +33,8 @@ func Defaults() Config {
 		Temp:    filepath.Join(".", "temp"),
 		Cache:   filepath.Join(home, ".pkg"),
 		Binpkgs: filepath.Join(home, ".pkg"),
+		Index:   filepath.Join(home, ".pkg", "index.json"),
+		Arch:    "x86_64",
 		Root:    "/",
 	}
 }
@@ -84,6 +89,12 @@ func Load(path string) (Config, error) {
 			c.Cache = value
 		case "binpkgs", "binpkgdir", "package", "packages":
 			c.Binpkgs = value
+		case "index", "indexfile", "repository_index":
+			c.Index = value
+		case "repo_url", "repository_url", "url":
+			c.RepoURL = value
+		case "arch", "architecture":
+			c.Arch = value
 		case "root", "target_root", "target-root":
 			c.Root = value
 		}

@@ -62,3 +62,10 @@ func TestResolveSourceReportsMissingLocalArtifact(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+func TestDownloadRejectsUnsupportedSchemeClearly(t *testing.T) {
+	err := Download("file:///tmp/source.tar.gz", filepath.Join(t.TempDir(), "source.tar.gz"), 0)
+	if err == nil || !strings.Contains(err.Error(), `unsupported URL scheme "file"`) {
+		t.Fatalf("error = %v", err)
+	}
+}

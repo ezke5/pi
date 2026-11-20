@@ -1,15 +1,39 @@
 # pi
 
-`pi` is a package manager starter for CRUX Linux. `pi install` prefers the
-highest-version matching cached binary archive and falls back to building from
-the dependency-resolved PKGBUILD graph when no cached archive is available.
+`pi` is a package manager starter for CRUX Linux. The repository contains two
+applications: `pi` and `pi-index`. `pi install` prefers a checksum-verified
+binary selected from the JSON repository index (then the local binary cache)
+and falls back to the dependency-resolved PKGBUILD graph.
 
 ## Build
 
 ```sh
-go build ./...
-go test ./...
+make build       # bin/pi and bin/pi-index
+make test        # all unit and integration tests
+make verify      # build, test, and execute both applications
+make clean
 ```
+
+The index helper incrementally merges archives without removing older versions:
+
+```sh
+bin/pi-index --packages ./pkg --index ./pkg/index.json \
+  --base-url https://github.com/OWNER/REPO/releases/download/rolling
+```
+
+`pi-index` reports warnings for empty package directories and filenames that do
+not match `<pkgname>-<pkgver>-<pkgrel>.pkg.tar.zst` or
+`<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.zst`; existing index entries are
+preserved in those cases. Package names containing hyphens are supported. Package inspection and extraction explicitly require
+zstd-compressed archives and explain when a gzip or other format is being
+used with a `.pkg.tar.zst` name.
+
+Use the published index and assets during installation with
+`--index ./pkg/index.json` or `--repo-url
+https://github.com/OWNER/REPO/releases/download/rolling`. `--source-build`
+explicitly bypasses binary selection. A downloaded or cached indexed archive is
+SHA-256 verified; failed downloads and checksum validation automatically fall
+back to PKGBUILD source resolution.
 
 ## Safe examples
 
@@ -34,4 +58,6 @@ entries, then exports the recipe metadata variables (`pkgname`, `pkgver`,
 retaining the staged archive. Use `--reuse` to accept cached sources; when
 re-download mode is requested interactively, `pi` asks before replacing an
 existing cached source. `pi install <name>` resolves the highest-version
-matching package archive from the configured cache.
+matching package archive from the configured index/cache. The GitHub Actions
+workflow builds both applications, updates `index.json`, and publishes the
+index and package archives to the rolling GitHub Release with `gh`.
