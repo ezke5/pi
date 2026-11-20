@@ -48,6 +48,8 @@ type BuildConfig struct {
 	LDFLAGS         string
 	Strip           string
 	DownloadTimeout time.Duration
+	KeepWork        bool
+	CleanJunk       bool
 }
 
 type UseConfig struct {
@@ -71,6 +73,8 @@ func Defaults() Config {
 	build := BuildConfig{
 		Jobs: runtime.NumCPU(), CFlags: "", CFLAGS: "", CXXFlags: "", CXXFLAGS: "", LdFlags: "", LDFLAGS: "", Strip: "true",
 		DownloadTimeout: DefaultDownloadTimeout,
+		KeepWork:        false,
+		CleanJunk:       true,
 	}
 	use := UseConfig{PackageUse: map[string][]string{}}
 	c := Config{
@@ -147,6 +151,18 @@ func Load(path string) (Config, error) {
 					return c, fmt.Errorf("parse config %q line %d (%s): %w", path, lineNo, key, parseErr)
 				}
 				c.Build.DownloadTimeout, c.DownloadTimeout = d, d
+			case "keep_work", "keep-work":
+				b, parseErr := parseBoolSetting(value)
+				if parseErr != nil {
+					return c, fmt.Errorf("parse config %q line %d (%s): %w", path, lineNo, key, parseErr)
+				}
+				c.Build.KeepWork = b
+			case "clean_junk", "clean-junk":
+				b, parseErr := parseBoolSetting(value)
+				if parseErr != nil {
+					return c, fmt.Errorf("parse config %q line %d (%s): %w", path, lineNo, key, parseErr)
+				}
+				c.Build.CleanJunk = b
 			}
 			continue
 		}
@@ -250,6 +266,17 @@ func parseDurationSetting(value string) (time.Duration, error) {
 		return 0, fmt.Errorf("duration %q must be positive", value)
 	}
 	return d, nil
+}
+
+func parseBoolSetting(value string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true", "yes", "1", "on":
+		return true, nil
+	case "false", "no", "0", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid boolean %q (expected true/false)", value)
+	}
 }
 
 func (c *Config) loadPackageUse() error {

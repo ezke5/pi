@@ -296,3 +296,19 @@ func TestCreateWithUSENormalizesOwnershipToRoot(t *testing.T) {
 		t.Fatalf("expected at least 4 tar entries, saw %d", seen)
 	}
 }
+
+func TestCreateWithUSERejectsEmptyStagingDir(t *testing.T) {
+	root := t.TempDir()
+	emptyDir := filepath.Join(root, "empty")
+	if err := os.MkdirAll(emptyDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(root, "empty-1-1.pkg.tar.zst")
+	err := Create(emptyDir, output, "empty", "1", "1", nil)
+	if err == nil || !strings.Contains(err.Error(), "is empty") {
+		t.Fatalf("expected empty staging dir error, got: %v", err)
+	}
+	if _, statErr := os.Stat(output); !os.IsNotExist(statErr) {
+		t.Fatalf("archive should not exist on empty staging failure: %v", statErr)
+	}
+}

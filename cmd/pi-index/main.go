@@ -20,18 +20,23 @@ func main() {
 	packages := fs.String("packages", ".", "directory containing package archives")
 	baseURL := fs.String("base-url", "", "base URL for package downloads")
 	arch := fs.String("arch", defaultArch(), "package architecture")
+	prune := fs.Bool("prune", false, "remove index entries whose archives are no longer present in --packages")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
 
-	if err := runIndex(*indexPath, *packages, *baseURL, *arch, os.Stderr); err != nil {
+	if err := runIndexWithOptions(*indexPath, *packages, *baseURL, *arch, *prune, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
 func runIndex(indexPath, packages, baseURL, arch string, stderr io.Writer) error {
+	return runIndexWithOptions(indexPath, packages, baseURL, arch, false, stderr)
+}
+
+func runIndexWithOptions(indexPath, packages, baseURL, arch string, prune bool, stderr io.Writer) error {
 	if baseURL != "" {
 		if err := validateBaseURL(baseURL); err != nil {
 			return err
@@ -52,6 +57,7 @@ func runIndex(indexPath, packages, baseURL, arch string, stderr io.Writer) error
 		return err
 	}
 	seen := 0
+	present := map[string]bool{}
 	for _, path := range paths {
 		name, ver, rel, parsedArch, ok := parseArchive(filepath.Base(path), arch)
 		if !ok {
@@ -94,13 +100,18 @@ func runIndex(indexPath, packages, baseURL, arch string, stderr io.Writer) error
 		if parsedArch == "" {
 			parsedArch = arch
 		}
+		filename := filepath.Base(path)
+		present[filename] = true
 		repoindex.Merge(&index, repoindex.Entry{
 			Pkgname: name, Pkgver: ver, Pkgrel: rel, Arch: parsedArch,
-			Filename: filepath.Base(path), URL: binaryURL(baseURL, filepath.Base(path)),
+			Filename: filename, URL: binaryURL(baseURL, filename),
 			SHA256: sum, Size: info.Size(),
 			USEFlags: useFlags, USEDisabled: useDisabled, USEHash: useHash,
 		})
 		seen++
+	}
+	if prune {
+		repoindex.Prune(&index, present)
 	}
 	if len(paths) == 0 {
 		fmt.Fprintf(stderr, "warning: no .pkg.tar.zst archives found in %q; existing index versions were preserved\n", packages)

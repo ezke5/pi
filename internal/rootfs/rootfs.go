@@ -4,6 +4,7 @@ package rootfs
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -87,10 +88,15 @@ func Bootstrap(root string) error {
 		{"usr/lib64", 0o755},
 		{"etc", 0o755},
 		{"dev", 0o755},
+		{"dev/pts", 0o755},
+		{"dev/shm", os.ModeSticky | 0o777},
 		{"proc", 0o755},
 		{"sys", 0o755},
+		{"run", 0o755},
+		{"root", 0o750},
 		{"tmp", os.ModeSticky | 0o777},
 		{"var", 0o755},
+		{"var/tmp", os.ModeSticky | 0o777},
 	}
 	for _, d := range dirs {
 		p, err := TargetPath(abs, "/"+d.rel)
@@ -151,4 +157,41 @@ func EnsureSkeletonIfEmpty(root string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// RunLDConfig refreshes /etc/ld.so.cache inside root when /etc/ld.so.conf
+// exists and ldconfig is available (matching CRUX pkgutils pkgutil::ldconfig).
+func RunLDConfig(root string) error {
+	confPath, err := TargetPath(root, "/etc/ld.so.conf")
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(confPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	ldconfigBin, err := exec.LookPath("ldconfig")
+	if err != nil {
+		for _, candidate := range []string{"/sbin/ldconfig", "/usr/sbin/ldconfig"} {
+			if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
+				ldconfigBin = candidate
+				err = nil
+				break
+			}
+		}
+		if err != nil {
+			return nil
+		}
+	}
+	out, err := exec.Command(ldconfigBin, "-r", root).CombinedOutput()
+	if err != nil {
+		detail := strings.TrimSpace(string(out))
+		if detail != "" {
+			return fmt.Errorf("ldconfig -r %q: %w (%s)", root, err, detail)
+		}
+		return fmt.Errorf("ldconfig -r %q: %w", root, err)
+	}
+	return nil
 }

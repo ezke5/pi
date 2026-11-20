@@ -26,6 +26,16 @@ type Resolver struct {
 }
 
 func (r Resolver) Resolve(names ...string) (Graph, error) {
+	return r.resolve(true, names...)
+}
+
+// ResolveRuntime resolves only runtime Depends (excluding build-only
+// MakeDepends), suitable when installing prebuilt binary archives.
+func (r Resolver) ResolveRuntime(names ...string) (Graph, error) {
+	return r.resolve(false, names...)
+}
+
+func (r Resolver) resolve(includeMakeDepends bool, names ...string) (Graph, error) {
 	g := Graph{Nodes: map[string]Node{}}
 	visiting := map[string]int{}
 	var stack []string
@@ -76,7 +86,9 @@ func (r Resolver) Resolve(names ...string) (Graph, error) {
 		visiting[name] = 1
 		stack = append(stack, name)
 		all := append([]string{}, recipe.Depends...)
-		all = append(all, recipe.MakeDepends...)
+		if includeMakeDepends {
+			all = append(all, recipe.MakeDepends...)
+		}
 		sort.Strings(all)
 		for _, dep := range all {
 			if err := visit(dep, name); err != nil {

@@ -1,13 +1,19 @@
 package rootfs
 
 import (
+	"bufio"
+	"bytes"
+	"debug/elf"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 )
 
 // MountSpec describes a virtual or bind mount prepared inside a target rootfs.
@@ -23,27 +29,34 @@ func ChrootMounts() []MountSpec {
 	return []MountSpec{
 		{Source: "/dev", Target: "dev", Bind: true},
 		{Source: "/dev/pts", Target: "dev/pts", Bind: true},
+		{Source: "tmpfs", Target: "dev/shm", FSType: "tmpfs"},
 		{Source: "proc", Target: "proc", FSType: "proc"},
 		{Source: "sysfs", Target: "sys", FSType: "sysfs"},
 	}
 }
 
-// ChrootRunner executes chroot setup, command invocation, and reverse unmount
-// cleanup. Hooks default to real system commands and can be overridden in tests.
+// ChrootRunner executes chroot setup, preflight checks, command invocation, and
+// reverse unmount cleanup. Hooks default to real system commands and can be
+// overridden in tests.
 type ChrootRunner struct {
-	HostResolvConf string
-	Mount          func(spec MountSpec, targetPath string) error
-	Unmount        func(targetPath string) error
-	Exec           func(root string, cmd []string, stdin io.Reader, stdout, stderr io.Writer) error
+	HostResolvConf  string
+	Mount           func(spec MountSpec, targetPath string) error
+	Unmount         func(targetPath string) error
+	IsMounted       func(targetPath string) (bool, error)
+	CheckExecutable func(root, execPath string) error
+	Exec            func(root string, cmd []string, stdin io.Reader, stdout, stderr io.Writer) error
 }
 
-// DefaultChrootRunner returns a ChrootRunner backed by mount, umount, and chroot.
+// DefaultChrootRunner returns a ChrootRunner backed by mount, umount, mountinfo,
+// ELF PT_INTERP preflight, and chroot.
 func DefaultChrootRunner() ChrootRunner {
 	return ChrootRunner{
-		HostResolvConf: "/etc/resolv.conf",
-		Mount:          defaultMount,
-		Unmount:        defaultUnmount,
-		Exec:           defaultExecChroot,
+		HostResolvConf:  "/etc/resolv.conf",
+		Mount:           defaultMount,
+		Unmount:         defaultUnmount,
+		IsMounted:       defaultIsMounted,
+		CheckExecutable: CheckChrootExecutable,
+		Exec:            defaultExecChroot,
 	}
 }
 
@@ -69,7 +82,8 @@ func DefaultChrootCommand(root string) []string {
 	return []string{"/bin/sh"}
 }
 
-// Run executes the chroot lifecycle with guaranteed reverse-order unmounting.
+// Run executes the chroot lifecycle with guaranteed reverse-order unmounting of
+// only the mounts created by this invocation.
 func (r ChrootRunner) Run(root string, cmd []string, stdin io.Reader, stdout, stderr io.Writer) (retErr error) {
 	target, err := Validate(root, false)
 	if err != nil {
@@ -95,6 +109,23 @@ func (r ChrootRunner) Run(root string, cmd []string, stdin io.Reader, stdout, st
 	if execFn == nil {
 		execFn = defaultExecChroot
 	}
+	isMountedFn := r.IsMounted
+	if isMountedFn == nil && r.Mount == nil {
+		isMountedFn = defaultIsMounted
+	}
+	checkExecFn := r.CheckExecutable
+	if checkExecFn == nil && r.Exec == nil {
+		checkExecFn = CheckChrootExecutable
+	}
+
+	if len(cmd) == 0 {
+		cmd = DefaultChrootCommand(target)
+	}
+	if checkExecFn != nil && len(cmd) > 0 && strings.HasPrefix(cmd[0], "/") {
+		if err := checkExecFn(target, cmd[0]); err != nil {
+			return err
+		}
+	}
 
 	mounts := ChrootMounts()
 	mounted := make([]string, 0, len(mounts))
@@ -114,6 +145,15 @@ func (r ChrootRunner) Run(root string, cmd []string, stdin io.Reader, stdout, st
 		if err := os.MkdirAll(mountTarget, 0o755); err != nil {
 			return fmt.Errorf("create chroot mount point %q: %w", mountTarget, err)
 		}
+		if isMountedFn != nil {
+			alreadyMounted, checkErr := isMountedFn(mountTarget)
+			if checkErr != nil {
+				return fmt.Errorf("check mount state of %q: %w", mountTarget, checkErr)
+			}
+			if alreadyMounted {
+				continue
+			}
+		}
 		if err := mountFn(spec, mountTarget); err != nil {
 			return fmt.Errorf("mount %s on %q: %w", spec.Source, mountTarget, err)
 		}
@@ -126,13 +166,141 @@ func (r ChrootRunner) Run(root string, cmd []string, stdin io.Reader, stdout, st
 		}
 	}
 
-	if len(cmd) == 0 {
-		cmd = DefaultChrootCommand(target)
-	}
 	if err := execFn(target, cmd, stdin, stdout, stderr); err != nil {
 		return fmt.Errorf("execute chroot command %v in %q: %w", cmd, target, err)
 	}
 	return nil
+}
+
+// CheckChrootExecutable verifies that execPath resolves inside root and, if it
+// is a dynamically linked ELF binary, that its PT_INTERP dynamic linker (e.g.
+// /lib64/ld-linux-x86-64.so.2) also resolves inside root.
+func CheckChrootExecutable(root, execPath string) error {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Errorf("resolve chroot root %q: %w", root, err)
+	}
+	resolved, err := resolvePathInRoot(rootAbs, execPath)
+	if err != nil {
+		return fmt.Errorf("chroot command %q is missing or broken in %q: %w", execPath, rootAbs, err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return fmt.Errorf("inspect chroot command %q in %q: %w", execPath, rootAbs, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("chroot command %q in %q is a directory", execPath, rootAbs)
+	}
+	interp, err := readELFInterp(resolved)
+	if err != nil || interp == "" {
+		return nil
+	}
+	if _, err := resolvePathInRoot(rootAbs, interp); err != nil {
+		return fmt.Errorf("chroot binary %q requires missing ELF interpreter %q in %q: %w", execPath, interp, rootAbs, err)
+	}
+	return nil
+}
+
+func readELFInterp(path string) (string, error) {
+	ef, err := elf.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer ef.Close()
+	for _, prog := range ef.Progs {
+		if prog.Type != elf.PT_INTERP {
+			continue
+		}
+		data, err := io.ReadAll(prog.Open())
+		if err != nil {
+			return "", err
+		}
+		data = bytes.TrimRight(data, "\x00")
+		return string(data), nil
+	}
+	return "", nil
+}
+
+func resolvePathInRoot(rootAbs, rootRelPath string) (string, error) {
+	cur, err := TargetPath(rootAbs, rootRelPath)
+	if err != nil {
+		return "", err
+	}
+	for depth := 0; depth < 40; depth++ {
+		info, err := os.Lstat(cur)
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			return cur, nil
+		}
+		target, err := os.Readlink(cur)
+		if err != nil {
+			return "", err
+		}
+		var next string
+		if filepath.IsAbs(target) {
+			next, err = TargetPath(rootAbs, target)
+			if err != nil {
+				return "", err
+			}
+		} else {
+			next = filepath.Clean(filepath.Join(filepath.Dir(cur), target))
+			rel, relErr := filepath.Rel(rootAbs, next)
+			if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return "", fmt.Errorf("symlink target %q escapes root", target)
+			}
+		}
+		cur = next
+	}
+	return "", fmt.Errorf("symlink loop resolving %q", rootRelPath)
+}
+
+func defaultIsMounted(targetPath string) (bool, error) {
+	return isMountedFromFile("/proc/self/mountinfo", targetPath)
+}
+
+func isMountedFromFile(mountInfoPath, targetPath string) (bool, error) {
+	cleanTarget, err := filepath.Abs(targetPath)
+	if err != nil {
+		return false, err
+	}
+	cleanTarget = filepath.Clean(cleanTarget)
+	f, err := os.Open(mountInfoPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 5 {
+			continue
+		}
+		mountPoint := unescapeMountInfoField(fields[4])
+		if filepath.Clean(mountPoint) == cleanTarget {
+			return true, nil
+		}
+	}
+	return false, scanner.Err()
+}
+
+func unescapeMountInfoField(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) {
+			if val, err := strconv.ParseUint(s[i+1:i+4], 8, 8); err == nil {
+				b.WriteByte(byte(val))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 func copyResolvConfIfPresent(hostPath, targetRoot string) error {
@@ -213,5 +381,26 @@ func defaultExecChroot(root string, cmdArgs []string, stdin io.Reader, stdout, s
 	c.Stdin = stdin
 	c.Stdout = stdout
 	c.Stderr = stderr
-	return c.Run()
+	if err := c.Start(); err != nil {
+		return err
+	}
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case sig := <-sigCh:
+				if c.Process != nil {
+					_ = c.Process.Signal(sig)
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+	err := c.Wait()
+	close(done)
+	signal.Stop(sigCh)
+	return err
 }

@@ -59,7 +59,7 @@ package() {
 		t.Fatal(err)
 	}
 	var output bytes.Buffer
-	if err := Run([]string{"--ports", ports, "--work", work, "--cache", cache, "build", "demo"}, &output, &output); err != nil {
+	if err := Run([]string{"--ports", ports, "--work", work, "--cache", cache, "--keep-work", "build", "demo"}, &output, &output); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(output.String(), "built "+filepath.Join(cache, "demo-1-1.pkg.tar.zst")) {
@@ -665,5 +665,201 @@ func TestChrootSubcommandDryRunAndFlagSplitting(t *testing.T) {
 
 	if err := Run([]string{"--root", "/", "--allow-host-root", "chroot", "/bin/sh"}, &output, &output); err == nil {
 		t.Fatal("expected chroot into host root / to be rejected")
+	}
+}
+
+func TestBuildSanitizesHostEnvIsolatesPkgdirAndCleansWork(t *testing.T) {
+	if _, err := exec.LookPath("zstd"); err != nil {
+		t.Skip("zstd is required for package archive creation")
+	}
+	t.Setenv("LD_LIBRARY_PATH", "/host/polluted/lib")
+	t.Setenv("PKG_CONFIG_PATH", "/host/polluted/pkgconfig")
+	t.Setenv("DESTDIR", "/host/polluted/dest")
+
+	root := t.TempDir()
+	ports := filepath.Join(root, "ports")
+	work := filepath.Join(root, "work")
+	cache := filepath.Join(root, "cache")
+	recipeDir := filepath.Join(ports, "hygiene")
+	for _, dir := range []string{recipeDir, work, cache} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recipe := `pkgname=hygiene
+pkgver=1.0
+pkgrel=1
+build() {
+  test -z "$LD_LIBRARY_PATH"
+  test -z "$PKG_CONFIG_PATH"
+  test -z "$DESTDIR"
+  test "$LC_ALL" = "C.UTF-8"
+  mkdir -p "$pkgdir/stale"
+  echo leaked > "$pkgdir/stale/from-build"
+}
+package() {
+  test ! -e "$pkgdir/stale/from-build"
+  mkdir -p "$pkgdir/usr/bin" "$pkgdir/usr/share/info"
+  printf '#!/bin/sh\necho ok\n' > "$pkgdir/usr/bin/hygiene"
+  chmod 755 "$pkgdir/usr/bin/hygiene"
+  printf 'junk' > "$pkgdir/usr/share/info/dir"
+}
+`
+	if err := os.WriteFile(filepath.Join(recipeDir, "PKGBUILD"), []byte(recipe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := Run([]string{"--ports", ports, "--work", work, "--cache", cache, "build", "hygiene"}, &output, &output); err != nil {
+		t.Fatalf("hygiene build failed: %v\n%s", err, output.String())
+	}
+	// Work directory must be cleaned by default on success.
+	if _, err := os.Stat(filepath.Join(work, "hygiene-1.0")); !os.IsNotExist(err) {
+		t.Fatalf("expected work directory to be cleaned after build, stat err=%v", err)
+	}
+	archivePath := filepath.Join(cache, "hygiene-1.0-1.pkg.tar.zst")
+	entries, err := archive.Entries(archivePath)
+	if err != nil {
+		t.Fatalf("read archive entries: %v", err)
+	}
+	for _, e := range entries {
+		if e.Path == "/usr/share/info/dir" || strings.HasPrefix(e.Path, "/stale") || strings.HasPrefix(e.Path, "/var/lib/pi/packages") {
+			t.Fatalf("unexpected leaked entry in archive: %+v", e)
+		}
+	}
+}
+
+func TestBuildRejectsEmptyPkgdir(t *testing.T) {
+	root := t.TempDir()
+	ports := filepath.Join(root, "ports")
+	work := filepath.Join(root, "work")
+	cache := filepath.Join(root, "cache")
+	recipeDir := filepath.Join(ports, "empty")
+	for _, dir := range []string{recipeDir, work, cache} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recipe := "pkgname=empty\npkgver=1\npkgrel=1\npackage() {\n  :\n}\n"
+	if err := os.WriteFile(filepath.Join(recipeDir, "PKGBUILD"), []byte(recipe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	err := Run([]string{"--ports", ports, "--work", work, "--cache", cache, "build", "empty"}, &output, &output)
+	if err == nil || !strings.Contains(err.Error(), "empty staging directory") {
+		t.Fatalf("expected empty staging directory error, got: %v", err)
+	}
+}
+
+func TestVerifySubcommandAndSmartSkipRepairOnBrokenSymlinkAndModeDrift(t *testing.T) {
+	if _, err := exec.LookPath("zstd"); err != nil {
+		t.Skip("zstd is required for package archive creation")
+	}
+	root := t.TempDir()
+	ports := filepath.Join(root, "ports")
+	work := filepath.Join(root, "work")
+	temp := filepath.Join(root, "temp")
+	cache := filepath.Join(root, "cache")
+	target := filepath.Join(root, "target")
+	recipeDir := filepath.Join(ports, "libc-demo")
+	for _, dir := range []string{recipeDir, work, temp, cache} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recipe := `pkgname=libc-demo
+pkgver=2.40
+pkgrel=1
+package() {
+  mkdir -p "$pkgdir/lib64" "$pkgdir/usr/lib"
+  printf 'so' > "$pkgdir/usr/lib/ld-linux-x86-64.so.2"
+  chmod 555 "$pkgdir/usr/lib/ld-linux-x86-64.so.2"
+  ln -s ../usr/lib/ld-linux-x86-64.so.2 "$pkgdir/lib64/ld-linux-x86-64.so.2"
+}
+`
+	if err := os.WriteFile(filepath.Join(recipeDir, "PKGBUILD"), []byte(recipe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	baseArgs := []string{"--ports", ports, "--work", work, "--temp", temp, "--cache", cache, "--root", target}
+	var output bytes.Buffer
+	if err := Run(append(append([]string{}, baseArgs...), "install", "libc-demo"), &output, &output); err != nil {
+		t.Fatalf("install failed: %v\n%s", err, output.String())
+	}
+	output.Reset()
+	if err := Run(append(append([]string{}, baseArgs...), "verify"), &output, &output); err != nil {
+		t.Fatalf("verify failed on healthy install: %v\n%s", err, output.String())
+	}
+	if !strings.Contains(output.String(), "ok: libc-demo-2.40-1") {
+		t.Fatalf("unexpected verify output: %s", output.String())
+	}
+
+	// Induce mode drift on 0555 library -> verify fails & smart-skip repairs it.
+	ldFile := filepath.Join(target, "usr", "lib", "ld-linux-x86-64.so.2")
+	if err := os.Chmod(ldFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	if err := Run(append(append([]string{}, baseArgs...), "verify"), &output, &output); err == nil || !strings.Contains(output.String(), "mode drift") {
+		t.Fatalf("expected verify mode drift failure, got err=%v output=%s", err, output.String())
+	}
+	output.Reset()
+	if err := Run(append(append([]string{}, baseArgs...), "install", "libc-demo"), &output, &output); err != nil {
+		t.Fatalf("repair install failed: %v\n%s", err, output.String())
+	}
+	if !strings.Contains(output.String(), "mode drift") {
+		t.Fatalf("expected diagnostic reinstall reason in output: %s", output.String())
+	}
+	info, err := os.Stat(ldFile)
+	if err != nil || info.Mode().Perm() != 0o555 {
+		t.Fatalf("repaired library mode = %04o, err=%v", info.Mode().Perm(), err)
+	}
+}
+
+func TestBinaryInstallSkipsMakedependsAndRecordsRuntimeDependsOnly(t *testing.T) {
+	if _, err := exec.LookPath("zstd"); err != nil {
+		t.Skip("zstd is required for package archive creation")
+	}
+	root := t.TempDir()
+	ports := filepath.Join(root, "ports")
+	work := filepath.Join(root, "work")
+	temp := filepath.Join(root, "temp")
+	cache := filepath.Join(root, "cache")
+	target := filepath.Join(root, "target")
+	for _, dir := range []string{work, temp, cache} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writePkg := func(name, content string) {
+		dir := filepath.Join(ports, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "PKGBUILD"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writePkg("libfoo", "pkgname=libfoo\npkgver=1\npkgrel=1\npackage() {\n  mkdir -p \"$pkgdir/usr/lib\"\n  printf 'lib' > \"$pkgdir/usr/lib/libfoo.so\"\n}\n")
+	writePkg("meson-tool", "pkgname=meson-tool\npkgver=1\npkgrel=1\npackage() {\n  mkdir -p \"$pkgdir/usr/bin\"\n  printf 'meson' > \"$pkgdir/usr/bin/meson-tool\"\n}\n")
+	writePkg("dwl-app", "pkgname=dwl-app\npkgver=1\npkgrel=1\ndepends=(libfoo)\nmakedepends=(meson-tool)\npackage() {\n  mkdir -p \"$pkgdir/usr/bin\"\n  printf 'dwl' > \"$pkgdir/usr/bin/dwl-app\"\n}\n")
+
+	// Pre-build libfoo and dwl-app archives into cache, then install dwl-app.
+	var output bytes.Buffer
+	if err := Run([]string{"--ports", ports, "--work", work, "--temp", temp, "--cache", cache, "build", "dwl-app"}, &output, &output); err != nil {
+		t.Fatalf("build failed: %v\n%s", err, output.String())
+	}
+	output.Reset()
+	if err := Run([]string{"--ports", ports, "--work", work, "--temp", temp, "--cache", cache, "--root", target, "install", "dwl-app"}, &output, &output); err != nil {
+		t.Fatalf("binary install failed: %v\n%s", err, output.String())
+	}
+	// meson-tool (makedepends) must NOT be installed into the runtime rootfs.
+	if _, err := os.Stat(filepath.Join(target, "usr", "bin", "meson-tool")); !os.IsNotExist(err) {
+		t.Fatalf("makedepends meson-tool should not be installed when prebuilt binary is used")
+	}
+	rec, err := state.Load(target, "dwl-app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.Depends) != 1 || rec.Depends[0] != "libfoo" {
+		t.Fatalf("recorded runtime depends = %v, want [libfoo]", rec.Depends)
 	}
 }

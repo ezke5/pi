@@ -152,7 +152,27 @@ func CreateWithUSE(pkgDir, output, pkgname, pkgver, pkgrel, arch string, useFlag
 	if _, err := io.WriteString(tw, metadata); err != nil {
 		return fmt.Errorf("write .PKGINFO: %w", err)
 	}
+	if len(entries) > 0 {
+		fpData := footprint.Format(entries)
+		fpHdr := &tar.Header{
+			Name:     ".FOOTPRINT",
+			Mode:     0o644,
+			Size:     int64(len(fpData)),
+			Typeflag: tar.TypeReg,
+			Uid:      0,
+			Gid:      0,
+			Uname:    "root",
+			Gname:    "root",
+		}
+		if err := tw.WriteHeader(fpHdr); err != nil {
+			return fmt.Errorf("write .FOOTPRINT header: %w", err)
+		}
+		if _, err := io.WriteString(tw, fpData); err != nil {
+			return fmt.Errorf("write .FOOTPRINT: %w", err)
+		}
+	}
 
+	payloadCount := 0
 	err = filepath.Walk(pkgDir, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return fmt.Errorf("inspect package staging path %q: %w", path, walkErr)
@@ -160,6 +180,7 @@ func CreateWithUSE(pkgDir, output, pkgname, pkgver, pkgrel, arch string, useFlag
 		if path == pkgDir {
 			return nil
 		}
+		payloadCount++
 		rel, err := filepath.Rel(pkgDir, path)
 		if err != nil {
 			return fmt.Errorf("make package-relative path: %w", err)
@@ -205,15 +226,33 @@ func CreateWithUSE(pkgDir, output, pkgname, pkgver, pkgrel, arch string, useFlag
 		tarFile.Close()
 		return err
 	}
+	if payloadCount == 0 {
+		tw.Close()
+		tarFile.Close()
+		return fmt.Errorf("package staging directory %q is empty; check DESTDIR=\"$pkgdir\"", pkgDir)
+	}
 	if err := tw.Close(); err != nil {
 		return fmt.Errorf("close tar writer: %w", err)
 	}
 	if err := tarFile.Close(); err != nil {
 		return fmt.Errorf("close temporary tar: %w", err)
 	}
-	cmd := exec.Command("zstd", "-q", "-f", "-o", output, tarName)
+	tmpZst, err := os.CreateTemp(filepath.Dir(output), ".pi-package-*.pkg.tar.zst")
+	if err != nil {
+		return fmt.Errorf("create temporary package archive: %w", err)
+	}
+	tmpZstName := tmpZst.Name()
+	tmpZst.Close()
+	defer os.Remove(tmpZstName)
+	cmd := exec.Command("zstd", "-q", "-f", "-o", tmpZstName, tarName)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("compress package with zstd: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	if err := os.Chmod(tmpZstName, 0o644); err != nil {
+		return fmt.Errorf("chmod package archive %q: %w", tmpZstName, err)
+	}
+	if err := os.Rename(tmpZstName, output); err != nil {
+		return fmt.Errorf("commit package archive %q: %w", output, err)
 	}
 	return nil
 }
@@ -251,7 +290,7 @@ func Extract(output string, archivePath, destRoot string) error {
 		if name == "." || name == "" {
 			continue
 		}
-		if filepath.ToSlash(name) == ".PKGINFO" {
+		if filepath.ToSlash(name) == ".PKGINFO" || filepath.ToSlash(name) == ".FOOTPRINT" {
 			continue
 		}
 		if filepath.IsAbs(name) || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
@@ -288,8 +327,9 @@ func Extract(output string, archivePath, destRoot string) error {
 				return fmt.Errorf("create package symlink %q: %w", dest, err)
 			}
 		case tar.TypeReg, tar.TypeRegA:
-			if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-				return fmt.Errorf("create package file directory %q: %w", filepath.Dir(dest), err)
+			parentDir := filepath.Dir(dest)
+			if err := os.MkdirAll(parentDir, 0o755); err != nil {
+				return fmt.Errorf("create package file directory %q: %w", parentDir, err)
 			}
 			if existing, statErr := os.Lstat(dest); statErr == nil {
 				if existing.Mode()&os.ModeSymlink != 0 {
@@ -305,20 +345,31 @@ func Extract(output string, archivePath, destRoot string) error {
 				return fmt.Errorf("inspect existing package file %q: %w", dest, statErr)
 			}
 			finalMode := hdr.FileInfo().Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
-			out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, finalMode.Perm()|0o200)
+			// Write to a sibling temp file and rename atomically (matching CRUX
+			// ARCHIVE_EXTRACT_UNLINK semantics): avoids ETXTBSY on running
+			// binaries/libraries and leaves no partial file on failure.
+			tmpOut, err := os.CreateTemp(parentDir, ".pi-extract-file-*")
 			if err != nil {
-				return fmt.Errorf("create package file %q: %w", dest, err)
+				return fmt.Errorf("create temporary package file for %q: %w", dest, err)
 			}
-			_, copyErr := io.Copy(out, tr)
-			closeErr := out.Close()
+			tmpOutName := tmpOut.Name()
+			_, copyErr := io.Copy(tmpOut, tr)
+			closeErr := tmpOut.Close()
 			if copyErr != nil {
+				_ = os.Remove(tmpOutName)
 				return fmt.Errorf("extract package file %q: %w", dest, copyErr)
 			}
 			if closeErr != nil {
+				_ = os.Remove(tmpOutName)
 				return fmt.Errorf("close package file %q: %w", dest, closeErr)
 			}
-			if err := os.Chmod(dest, finalMode); err != nil {
+			if err := os.Chmod(tmpOutName, finalMode); err != nil {
+				_ = os.Remove(tmpOutName)
 				return fmt.Errorf("set package file mode %q: %w", dest, err)
+			}
+			if err := os.Rename(tmpOutName, dest); err != nil {
+				_ = os.Remove(tmpOutName)
+				return fmt.Errorf("commit package file %q: %w", dest, err)
 			}
 		}
 	}
@@ -357,15 +408,15 @@ func Entries(archivePath string) ([]footprint.Entry, error) {
 			return nil, err
 		}
 		name := filepath.ToSlash(filepath.Clean(hdr.Name))
-		if name == ".PKGINFO" || name == "." || name == "" || strings.HasPrefix(name, "var/lib/pi/packages/") {
+		if name == ".PKGINFO" || name == ".FOOTPRINT" || name == "." || name == "" || strings.HasPrefix(name, "var/lib/pi/packages/") {
 			continue
 		}
-		entry := footprint.Entry{Path: "/" + strings.TrimPrefix(name, "/"), Mode: os.FileMode(hdr.Mode)}
+		entry := footprint.Entry{Path: "/" + strings.TrimPrefix(name, "/"), Mode: hdr.FileInfo().Mode().Perm()}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			entry.Type = "dir"
 		case tar.TypeSymlink:
-			entry.Type, entry.LinkTarget = "symlink", hdr.Linkname
+			entry.Type, entry.Mode, entry.LinkTarget = "symlink", 0o777, hdr.Linkname
 		default:
 			entry.Type = "file"
 		}

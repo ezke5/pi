@@ -6,9 +6,11 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/ezke5/pi/internal/archive"
 	"github.com/ezke5/pi/internal/binary"
@@ -39,6 +41,8 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	allowHost := fs.Bool("allow-host-root", false, "explicitly allow operating on /")
 	force := fs.Bool("force", false, "override dependency safety checks")
 	rebuild := fs.Bool("rebuild", false, "rebuild and reinstall even when matching version and USE state are already installed")
+	keepWork := fs.Bool("keep-work", false, "retain temporary build work directory after successful build")
+	noStrip := fs.Bool("no-strip", false, "disable automatic ELF/archive stripping during packaging")
 	dryRun := fs.Bool("dry-run", false, "show operations without changing the target")
 	reuse := fs.Bool("reuse", true, "reuse cached sources")
 	sourceBuild := fs.Bool("source-build", false, "always build from PKGBUILD instead of using binaries")
@@ -93,12 +97,14 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		return cmdBootstrap(c, *allowHost, *dryRun, stdout)
 	case "chroot":
 		return cmdChroot(c, pos[1:], *dryRun, os.Stdin, stdout, stderr)
+	case "verify":
+		return cmdVerify(c, pos[1:], *allowHost, stdout)
 	case "info", "inspect":
 		return cmdInfo(c, pos[1:], stdout)
 	case "build":
-		return cmdBuild(c, pos[1:], *reuse, *rebuild, *dryRun, stdout)
+		return cmdBuild(c, pos[1:], *reuse, *rebuild, *keepWork, *noStrip, *dryRun, stdout)
 	case "install":
-		return cmdInstall(c, pos[1:], *allowHost, *force, *rebuild, *dryRun, *reuse, *sourceBuild, stdout)
+		return cmdInstall(c, pos[1:], *allowHost, *force, *rebuild, *keepWork, *noStrip, *dryRun, *reuse, *sourceBuild, stdout)
 	case "remove":
 		return cmdRemove(c, pos[1:], *allowHost, *force, *dryRun, stdout)
 	case "list":
@@ -116,7 +122,7 @@ func splitFlags(args []string) ([]string, []string) {
 	}
 	boolFlags := map[string]bool{
 		"--allow-host-root": true, "--dry-run": true, "--reuse": true, "--force": true,
-		"--rebuild": true, "--source-build": true,
+		"--rebuild": true, "--keep-work": true, "--no-strip": true, "--source-build": true,
 	}
 	global := []string{}
 	rest := []string{}
@@ -139,7 +145,7 @@ func splitFlags(args []string) ([]string, []string) {
 				global = append(global, arg)
 				if arg == flagName && i+1 < len(args) {
 					next := args[i+1]
-					isSubcommand := next == "init" || next == "bootstrap" || next == "chroot" || next == "info" || next == "inspect" || next == "build" || next == "install" || next == "remove" || next == "list" || next == "help"
+					isSubcommand := next == "init" || next == "bootstrap" || next == "chroot" || next == "verify" || next == "info" || next == "inspect" || next == "build" || next == "install" || next == "remove" || next == "list" || next == "help"
 					if !strings.HasPrefix(next, "--") && !isSubcommand {
 						i++
 						global = append(global, next)
@@ -177,6 +183,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  init [dir]                 Create recommended directory and config layout")
 	fmt.Fprintln(w, "  bootstrap                  Create minimal FHS skeleton in target root")
 	fmt.Fprintln(w, "  chroot [CMD...]            Mount virtual filesystems and chroot into target root")
+	fmt.Fprintln(w, "  verify [name...]           Verify installed package footprints, modes, and symlinks")
 	fmt.Fprintln(w, "  info|inspect <PKGBUILD>    Inspect a package recipe")
 	fmt.Fprintln(w, "  build <PKGBUILD|name>      Build and package a recipe")
 	fmt.Fprintln(w, "  install <package|name>     Install a .pkg.tar.zst archive")
@@ -185,7 +192,52 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Global flags:")
 	fmt.Fprintln(w, "  --root, --ports, --work, --temp, --cache, --config, --index, --repo-url, --arch")
-	fmt.Fprintln(w, "  --dry-run, --allow-host-root, --force, --rebuild, --source-build")
+	fmt.Fprintln(w, "  --dry-run, --allow-host-root, --force, --rebuild, --keep-work, --no-strip, --source-build")
+}
+
+func cmdVerify(c config.Config, args []string, allowHost bool, stdout io.Writer) error {
+	target, err := rootfs.Validate(c.Root, allowHost)
+	if err != nil {
+		return err
+	}
+	lock, err := state.Lock(target, false)
+	if err != nil {
+		return err
+	}
+	defer lock.Unlock()
+
+	var names []string
+	if len(args) > 0 {
+		names = args
+	} else {
+		records, err := state.Installed(target)
+		if err != nil {
+			return err
+		}
+		for _, rec := range records {
+			names = append(names, rec.Pkgname)
+		}
+	}
+	failed := 0
+	for _, name := range names {
+		rec, err := state.Load(target, name)
+		if err != nil {
+			fmt.Fprintf(stdout, "FAIL: %s: %v\n", name, err)
+			failed++
+			continue
+		}
+		res := state.VerifyPackage(target, name, "", "", "")
+		if res.OK {
+			fmt.Fprintf(stdout, "ok: %s-%s-%s\n", rec.Pkgname, rec.Pkgver, rec.Pkgrel)
+		} else {
+			fmt.Fprintf(stdout, "FAIL: %s: %s\n", name, res.Reason())
+			failed++
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("verification failed for %d package(s)", failed)
+	}
+	return nil
 }
 
 func cmdBootstrap(c config.Config, allowHost, dryRun bool, stdout io.Writer) error {
@@ -284,7 +336,7 @@ func buildConfigSource(c config.Config) string {
 	return "defaults"
 }
 
-func cmdBuild(c config.Config, args []string, reuse, rebuild, dryRun bool, stdout io.Writer) error {
+func cmdBuild(c config.Config, args []string, reuse, rebuild, keepWork, noStrip, dryRun bool, stdout io.Writer) error {
 	if len(args) == 0 {
 		return fmt.Errorf("build requires a PKGBUILD path or package name")
 	}
@@ -297,10 +349,12 @@ func cmdBuild(c config.Config, args []string, reuse, rebuild, dryRun bool, stdou
 	for i, r := range recipes {
 		useState := c.ResolveUSE(r.Pkgname)
 		if !rebuild && c.Root != "" {
-			if ok, _ := state.VerifyInstalled(c.Root, r.Pkgname, r.Pkgver, r.Pkgrel, useState.Hash); ok {
+			if ok, reason := state.VerifyInstalled(c.Root, r.Pkgname, r.Pkgver, r.Pkgrel, useState.Hash); ok {
 				fmt.Fprintf(stdout, "%d. %s-%s-%s (skipping: already installed with matching USE hash %s; use --rebuild to force)\n",
 					i+1, r.Pkgname, r.Pkgver, r.Pkgrel, useState.Hash)
 				continue
+			} else if installed, loadErr := state.Load(c.Root, r.Pkgname); loadErr == nil && installed.Pkgver == r.Pkgver && installed.Pkgrel == r.Pkgrel {
+				fmt.Fprintf(stdout, "rebuilding %s-%s-%s: %s\n", r.Pkgname, r.Pkgver, r.Pkgrel, reason)
 			}
 		}
 		fmt.Fprintf(stdout, "%d. %s-%s-%s (build from PKGBUILD)\n", i+1, r.Pkgname, r.Pkgver, r.Pkgrel)
@@ -313,26 +367,51 @@ func cmdBuild(c config.Config, args []string, reuse, rebuild, dryRun bool, stdou
 		return err
 	}
 	for _, r := range toBuild {
-		if err := cmdBuildRecipe(c, r, reuse, stdout); err != nil {
+		if err := cmdBuildRecipe(c, r, reuse, keepWork, noStrip, stdout); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func cmdBuildRecipe(c config.Config, r pkgbuild.Recipe, reuse bool, stdout io.Writer) error {
+func cmdBuildRecipe(c config.Config, r pkgbuild.Recipe, reuse, keepWork, noStrip bool, stdout io.Writer) error {
+	if err := os.MkdirAll(c.Binpkgs, 0o755); err != nil {
+		return fmt.Errorf("create binpkgs directory %q: %w", c.Binpkgs, err)
+	}
+	if err := checkWritableDirs(c.Work, c.Cache, c.Binpkgs); err != nil {
+		return err
+	}
 	buildDir := filepath.Join(c.Work, r.Pkgname+"-"+r.Pkgver)
 	srcDir := filepath.Join(buildDir, "src")
 	pkgDir := filepath.Join(buildDir, "pkg")
+	tmpDir := filepath.Join(buildDir, "tmp")
+	homeDir := filepath.Join(buildDir, "home")
 	if err := os.RemoveAll(buildDir); err != nil {
 		return fmt.Errorf("clean build work directory %q: %w", buildDir, err)
 	}
-	if err := os.MkdirAll(srcDir, 0o755); err != nil {
-		return fmt.Errorf("create source directory %q: %w", srcDir, err)
+	for _, dir := range []string{srcDir, pkgDir, tmpDir, homeDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create build directory %q: %w", dir, err)
+		}
 	}
-	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
-		return fmt.Errorf("create package staging directory %q: %w", pkgDir, err)
-	}
+
+	retainWork := keepWork || c.Build.KeepWork
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	sigDone := make(chan struct{})
+	defer func() {
+		close(sigDone)
+		signal.Stop(sigCh)
+	}()
+	go func() {
+		select {
+		case <-sigCh:
+			if !retainWork {
+				_ = os.RemoveAll(buildDir)
+			}
+		case <-sigDone:
+		}
+	}()
 
 	for i, source := range r.Source {
 		sourceResult, err := fetch.ResolveSourceWithTimeout(source, filepath.Dir(r.Path), c.Cache, reuse, c.DownloadTimeout, os.Stdin, stdout)
@@ -358,51 +437,58 @@ func cmdBuildRecipe(c config.Config, r pkgbuild.Recipe, reuse bool, stdout io.Wr
 		}
 	}
 
-	cmdScript := "#!/bin/bash\nset -e\n" + fmt.Sprintf("unset CONFIG_SITE\nexport pkgname=%q\nexport pkgver=%q\nexport pkgrel=%q\nexport srcdir=%q\nexport pkgdir=%q\n", r.Pkgname, r.Pkgver, r.Pkgrel, srcDir, pkgDir)
 	useState := c.ResolveUSE(r.Pkgname)
-	jobs, cflags, cxxflags, ldflags, strip := c.Build.Jobs, c.Build.CFLAGS, c.Build.CXXFLAGS, c.Build.LDFLAGS, c.Build.Strip
-	if jobs == 0 {
-		jobs = c.Jobs
-	}
-	if cflags == "" {
-		cflags = c.CFLAGS
-	}
-	if cxxflags == "" {
-		cxxflags = c.CXXFLAGS
-	}
-	if ldflags == "" {
-		ldflags = c.LDFLAGS
-	}
-	if strip == "" {
-		strip = c.STRIP
-	}
-	cmdScript += fmt.Sprintf("export JOBS=%q\nexport CFLAGS=%q\nexport CXXFLAGS=%q\nexport LDFLAGS=%q\nexport STRIP=%q\n",
-		fmt.Sprintf("%d", jobs), cflags, cxxflags, ldflags, strip)
-	cmdScript += fmt.Sprintf("export PI_USE_FLAGS=%q\nexport PI_USE_DISABLED=%q\nexport PI_USE_HASH=%q\n",
-		strings.Join(useState.Enabled, " "), strings.Join(useState.Disabled, " "), useState.Hash)
-	cmdScript += "use_enabled() { case \" $PI_USE_FLAGS \" in *\" $1 \"*) return 0;; *) return 1;; esac; }\n"
-	cmdScript += "use_disabled() { case \" $PI_USE_DISABLED \" in *\" $1 \"*) return 0;; *) return 1;; esac; }\n"
-	cmdScript += "cd \"$srcdir\"\n"
-	if r.BuildFunction != "" {
-		cmdScript += "build() {\n" + r.BuildFunction + "\n}\n"
-	}
-	if r.PackageFunction != "" {
-		cmdScript += "package() {\n" + r.PackageFunction + "\n}\n"
-	}
-	if r.BuildFunction != "" {
-		cmdScript += "build\n"
-	}
-	if r.PackageFunction != "" {
-		cmdScript += "package\n"
-	}
-	cmd := exec.Command("bash")
-	cmd.Stdin = strings.NewReader(cmdScript)
-	cmd.Stdout = stdout
-	cmd.Stderr = stdout
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("execute build/package functions for %s: %w", r.Pkgname, err)
+	env := buildEnv(c, buildDir, srcDir, pkgDir, r, useState)
+	runPhase := func(phaseName, body string) error {
+		script := "#!/bin/bash\nset -e\numask 022\n"
+		script += "use_enabled() { case \" $PI_USE_FLAGS \" in *\" $1 \"*) return 0;; *) return 1;; esac; }\n"
+		script += "use_disabled() { case \" $PI_USE_DISABLED \" in *\" $1 \"*) return 0;; *) return 1;; esac; }\n"
+		script += "cd \"$srcdir\"\n"
+		script += phaseName + "() {\n" + body + "\n}\n"
+		script += phaseName + "\n"
+		cmd := exec.Command("bash")
+		cmd.Env = env
+		cmd.Stdin = strings.NewReader(script)
+		cmd.Stdout = stdout
+		cmd.Stderr = stdout
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("execute %s() for %s: %w", phaseName, r.Pkgname, err)
+		}
+		return nil
 	}
 
+	if r.BuildFunction != "" {
+		if err := runPhase("build", r.BuildFunction); err != nil {
+			return err
+		}
+	}
+	if r.PackageFunction != "" {
+		// Enforce strict build/staging separation when both build() and package()
+		// are defined so stray build() writes cannot leak into $pkgdir.
+		if r.BuildFunction != "" {
+			if err := os.RemoveAll(pkgDir); err != nil {
+				return fmt.Errorf("reset package staging directory %q: %w", pkgDir, err)
+			}
+			if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+				return fmt.Errorf("recreate package staging directory %q: %w", pkgDir, err)
+			}
+		}
+		if err := runPhase("package", r.PackageFunction); err != nil {
+			return err
+		}
+	}
+
+	if c.Build.CleanJunk {
+		if err := cleanStagingJunk(pkgDir); err != nil {
+			return err
+		}
+	}
+	_, _, _, _, stripSetting := effectiveBuildSettings(c)
+	if stripEnabled(stripSetting, noStrip) {
+		if err := stripStagingFiles(pkgDir, filepath.Dir(r.Path), stdout); err != nil {
+			return fmt.Errorf("strip staged files for %s: %w", r.Pkgname, err)
+		}
+	}
 	if err := archive.ValidateSymlinks(pkgDir); err != nil {
 		return fmt.Errorf("validate package %s: %w", r.Pkgname, err)
 	}
@@ -411,15 +497,19 @@ func cmdBuildRecipe(c config.Config, r pkgbuild.Recipe, reuse bool, stdout io.Wr
 	if err != nil {
 		return err
 	}
-	footprintPath := filepath.Join(pkgDir, "var", "lib", "pi", "packages", r.Pkgname+".footprint")
-	if err := footprint.Write(footprintPath, entries); err != nil {
-		return err
+	if len(entries) == 0 {
+		return fmt.Errorf("package %s produced an empty staging directory; check DESTDIR=\"$pkgdir\"", r.Pkgname)
 	}
 	output := filepath.Join(c.Binpkgs, r.ArchiveName())
-	useState = c.ResolveUSE(r.Pkgname)
 	if err := archive.CreateWithUSE(pkgDir, output, r.Pkgname, r.Pkgver, r.Pkgrel, c.Arch,
 		useState.Enabled, useState.Disabled, useState.Hash, entries, r.Backup); err != nil {
 		return err
+	}
+	diffRecipeFootprint(filepath.Dir(r.Path), entries, stdout)
+	if !retainWork {
+		if err := os.RemoveAll(buildDir); err != nil {
+			fmt.Fprintf(stdout, "warning: clean build work directory %q: %v\n", buildDir, err)
+		}
 	}
 	fmt.Fprintf(stdout, "built %s\n", output)
 	return nil
@@ -442,7 +532,7 @@ func copyFile(src, dest string) error {
 	return out.Close()
 }
 
-func cmdInstall(c config.Config, args []string, allowHost, force, rebuild, dryRun, reuse, sourceBuild bool, stdout io.Writer) error {
+func cmdInstall(c config.Config, args []string, allowHost, force, rebuild, keepWork, noStrip, dryRun, reuse, sourceBuild bool, stdout io.Writer) error {
 	if len(args) == 0 {
 		return fmt.Errorf("install requires a .pkg.tar.zst archive or package name")
 	}
@@ -541,7 +631,13 @@ func cmdInstall(c config.Config, args []string, allowHost, force, rebuild, dryRu
 			return installArchive(c, target, archivePath, record, force, false, stdout)
 		}
 	}
-	graph, err := (deps.Resolver{Ports: c.Ports}).Resolve(args[0])
+	resolver := deps.Resolver{Ports: c.Ports}
+	var graph deps.Graph
+	if sourceBuild || rebuild {
+		graph, err = resolver.Resolve(args[0])
+	} else {
+		graph, err = resolver.ResolveRuntime(args[0])
+	}
 	if err != nil {
 		archivePath := findPackageArchiveForUSE(c.Binpkgs, args[0], c.Arch, c.ResolveUSE(args[0]).Hash)
 		if archivePath == "" {
@@ -619,10 +715,12 @@ func cmdInstall(c config.Config, args []string, allowHost, force, rebuild, dryRu
 					checkVer, checkRel = entry.Pkgver, entry.Pkgrel
 				}
 			}
-			if ok, _ := state.VerifyInstalled(target, r.Pkgname, checkVer, checkRel, useState.Hash); ok {
+			if ok, reason := state.VerifyInstalled(target, r.Pkgname, checkVer, checkRel, useState.Hash); ok {
 				fmt.Fprintf(stdout, "%d. %s-%s-%s: already installed with matching USE hash %s; skipping (use --rebuild to reinstall)\n",
 					i+1, r.Pkgname, checkVer, checkRel, useState.Hash)
 				continue
+			} else if installed, loadErr := state.Load(target, r.Pkgname); loadErr == nil && installed.Pkgver == checkVer && installed.Pkgrel == checkRel {
+				fmt.Fprintf(stdout, "reinstalling %s-%s-%s: %s\n", r.Pkgname, checkVer, checkRel, reason)
 			}
 		}
 		var archivePath, source string
@@ -667,14 +765,48 @@ func cmdInstall(c config.Config, args []string, allowHost, force, rebuild, dryRu
 			continue
 		}
 		if source == "build from PKGBUILD" {
+			// Only resolve/install build-time makedepends when building from PKGBUILD.
+			if !sourceBuild && !rebuild && len(r.MakeDepends) > 0 {
+				if makeGraph, makeErr := resolver.Resolve(r.MakeDepends...); makeErr == nil {
+					for _, depName := range makeGraph.Order {
+						depRecipe := makeGraph.Nodes[depName].Recipe
+						depUSE := c.ResolveUSE(depRecipe.Pkgname)
+						if ok, _ := state.VerifyInstalled(target, depRecipe.Pkgname, depRecipe.Pkgver, depRecipe.Pkgrel, depUSE.Hash); ok {
+							continue
+						}
+						if err := c.EnsureDirs(); err != nil {
+							return err
+						}
+						if err := cmdBuildRecipe(c, depRecipe, reuse, keepWork, noStrip, stdout); err != nil {
+							return err
+						}
+						depArchive := filepath.Join(c.Binpkgs, depRecipe.ArchiveName())
+						if err := installArchive(c, target, depArchive, state.Record{
+							Pkgname:     depRecipe.Pkgname,
+							Pkgver:      depRecipe.Pkgver,
+							Pkgrel:      depRecipe.Pkgrel,
+							Arch:        c.Arch,
+							USEFlags:    depUSE.Enabled,
+							USEDisabled: depUSE.Disabled,
+							USEHash:     depUSE.Hash,
+							Depends:     append([]string(nil), depRecipe.Depends...),
+							Backup:      depRecipe.Backup,
+						}, force, false, stdout); err != nil {
+							return err
+						}
+					}
+				} else {
+					return makeErr
+				}
+			}
 			if err := c.EnsureDirs(); err != nil {
 				return err
 			}
-			if err := cmdBuildRecipe(c, r, reuse, stdout); err != nil {
+			if err := cmdBuildRecipe(c, r, reuse, keepWork, noStrip, stdout); err != nil {
 				return err
 			}
 		}
-		allDeps := append(append([]string(nil), r.Depends...), r.MakeDepends...)
+		runtimeDeps := append([]string(nil), r.Depends...)
 		if err := installArchive(c, target, archivePath, state.Record{
 			Pkgname:     r.Pkgname,
 			Pkgver:      version,
@@ -683,7 +815,7 @@ func cmdInstall(c config.Config, args []string, allowHost, force, rebuild, dryRu
 			USEFlags:    useState.Enabled,
 			USEDisabled: useState.Disabled,
 			USEHash:     useState.Hash,
-			Depends:     allDeps,
+			Depends:     runtimeDeps,
 			Backup:      r.Backup,
 		}, force, false, stdout); err != nil {
 			return err
@@ -719,6 +851,12 @@ func installArchive(c config.Config, target, archivePath string, record state.Re
 	if _, err := rootfs.EnsureSkeletonIfEmpty(target); err != nil {
 		return err
 	}
+	lock, err := state.Lock(target, true)
+	if err != nil {
+		return err
+	}
+	defer lock.Unlock()
+
 	oldEntries, err := state.Footprint(target, record.Pkgname)
 	if err != nil {
 		return err
@@ -768,6 +906,15 @@ func installArchive(c config.Config, target, archivePath string, record state.Re
 	}
 	if err := state.Write(target, record, entries); err != nil {
 		return err
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Path, "/lib/") || strings.HasPrefix(entry.Path, "/lib64/") ||
+			strings.HasPrefix(entry.Path, "/usr/lib/") || strings.HasPrefix(entry.Path, "/usr/lib64/") {
+			if err := rootfs.RunLDConfig(target); err != nil {
+				fmt.Fprintf(stdout, "warning: refresh dynamic linker cache: %v\n", err)
+			}
+			break
+		}
 	}
 	fmt.Fprintf(stdout, "installed %s into %s\n", archivePath, target)
 	return nil
@@ -944,6 +1091,11 @@ func cmdRemove(c config.Config, args []string, allowHost, force, dryRun bool, st
 		fmt.Fprintf(stdout, "dry-run: remove package %s from %s\n", args[0], target)
 		return nil
 	}
+	lock, err := state.Lock(target, true)
+	if err != nil {
+		return err
+	}
+	defer lock.Unlock()
 	recordDir, err := rootfs.TargetPath(target, "/var/lib/pi/packages")
 	if err != nil {
 		return err

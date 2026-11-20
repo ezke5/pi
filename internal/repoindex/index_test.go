@@ -83,3 +83,38 @@ func TestMergeKeepsSeparateUSEVariantsAndFindsExactState(t *testing.T) {
 		t.Fatalf("USE-aware find = %+v, %v", entry, ok)
 	}
 }
+
+func TestMergeEvictsSupersededFilenameOnUSEChange(t *testing.T) {
+	index := New()
+	Merge(&index, Entry{
+		Pkgname: "ncurses", Pkgver: "6.5", Pkgrel: "1", Arch: "x86_64",
+		Filename: "ncurses-6.5-1.pkg.tar.zst", SHA256: "old-sha", USEHash: "hash-old",
+	})
+	Merge(&index, Entry{
+		Pkgname: "ncurses", Pkgver: "6.5", Pkgrel: "1", Arch: "x86_64",
+		Filename: "ncurses-6.5-1.pkg.tar.zst", SHA256: "new-sha", USEHash: "hash-new",
+	})
+	group := index.Packages["ncurses"]
+	if len(group.Versions) != 1 || group.Versions[0].USEHash != "hash-new" || group.Versions[0].SHA256 != "new-sha" {
+		t.Fatalf("superseded filename entry was not evicted: %+v", group)
+	}
+}
+
+func TestPruneRemovesMissingArchives(t *testing.T) {
+	index := New()
+	Merge(&index,
+		Entry{Pkgname: "demo", Pkgver: "1", Pkgrel: "1", Arch: "x86_64", Filename: "demo-1-1.pkg.tar.zst"},
+		Entry{Pkgname: "demo", Pkgver: "2", Pkgrel: "1", Arch: "x86_64", Filename: "demo-2-1.pkg.tar.zst"},
+		Entry{Pkgname: "gone", Pkgver: "1", Pkgrel: "1", Arch: "x86_64", Filename: "gone-1-1.pkg.tar.zst"},
+	)
+	removed := Prune(&index, map[string]bool{"demo-1-1.pkg.tar.zst": true})
+	if removed != 2 {
+		t.Fatalf("removed = %d, want 2", removed)
+	}
+	if _, exists := index.Packages["gone"]; exists {
+		t.Fatalf("empty package group should have been removed: %+v", index.Packages)
+	}
+	if group := index.Packages["demo"]; len(group.Versions) != 1 || group.Latest != "1-1" {
+		t.Fatalf("pruned demo group = %+v", group)
+	}
+}
