@@ -9,13 +9,16 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/ezke5/pi/internal/archive"
+	"github.com/ezke5/pi/internal/binary"
 	"github.com/ezke5/pi/internal/config"
 	"github.com/ezke5/pi/internal/deps"
 	"github.com/ezke5/pi/internal/fetch"
 	"github.com/ezke5/pi/internal/footprint"
 	"github.com/ezke5/pi/internal/pkgbuild"
+	"github.com/ezke5/pi/internal/repoindex"
 	"github.com/ezke5/pi/internal/rootfs"
 	"github.com/ezke5/pi/internal/state"
 )
@@ -38,6 +41,10 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	force := fs.Bool("force", false, "override dependency safety checks")
 	dryRun := fs.Bool("dry-run", false, "show operations without changing the target")
 	reuse := fs.Bool("reuse", true, "reuse cached sources")
+	sourceBuild := fs.Bool("source-build", false, "always build from PKGBUILD instead of using binaries")
+	indexPath := fs.String("index", "", "JSON repository index")
+	repoURL := fs.String("repo-url", "", "base URL for a JSON repository index and binary assets")
+	arch := fs.String("arch", "", "package architecture")
 	if err := fs.Parse(global); err != nil {
 		return err
 	}
@@ -66,6 +73,15 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	if *cache != "" {
 		c.Binpkgs = *cache
 	}
+	if *indexPath != "" {
+		c.Index = *indexPath
+	}
+	if *repoURL != "" {
+		c.RepoURL = *repoURL
+	}
+	if *arch != "" {
+		c.Arch = *arch
+	}
 
 	switch pos[0] {
 	case "-h", "--help", "help":
@@ -78,7 +94,7 @@ func Run(args []string, stdout, stderr io.Writer) error {
 	case "build":
 		return cmdBuild(c, pos[1:], *reuse, *dryRun, stdout)
 	case "install":
-		return cmdInstall(c, pos[1:], *allowHost, *force, *dryRun, *reuse, stdout)
+		return cmdInstall(c, pos[1:], *allowHost, *force, *dryRun, *reuse, *sourceBuild, stdout)
 	case "remove":
 		return cmdRemove(c, pos[1:], *allowHost, *force, *dryRun, stdout)
 	case "list":
@@ -92,9 +108,11 @@ func splitFlags(args []string) ([]string, []string) {
 	valueFlags := map[string]bool{
 		"--ports": true, "--work": true, "--temp": true, "--cache": true,
 		"--root": true, "--config": true,
+		"--index": true, "--repo-url": true, "--arch": true,
 	}
 	boolFlags := map[string]bool{
 		"--allow-host-root": true, "--dry-run": true, "--reuse": true, "--force": true,
+		"--source-build": true,
 	}
 	global := []string{}
 	rest := []string{}
@@ -144,8 +162,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  list                       List installed package records")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Global flags:")
-	fmt.Fprintln(w, "  --root, --ports, --work, --temp, --cache, --config")
-	fmt.Fprintln(w, "  --dry-run, --allow-host-root, --force")
+	fmt.Fprintln(w, "  --root, --ports, --work, --temp, --cache, --config, --index, --repo-url, --arch")
+	fmt.Fprintln(w, "  --dry-run, --allow-host-root, --force, --source-build")
 }
 
 func cmdInit(c config.Config, configPath string, args []string, stdout io.Writer) error {
@@ -315,7 +333,7 @@ func copyFile(src, dest string) error {
 	return out.Close()
 }
 
-func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse bool, stdout io.Writer) error {
+func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse, sourceBuild bool, stdout io.Writer) error {
 	if len(args) == 0 {
 		return fmt.Errorf("install requires a .pkg.tar.zst archive or package name")
 	}
@@ -394,15 +412,55 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse 
 		}
 		return installArchive(c, target, archivePath, state.Record{Pkgname: strings.TrimSuffix(filepath.Base(archivePath), ".pkg.tar.zst")}, force, dryRun, stdout)
 	}
+	var index repoindex.Index
+	indexLoaded := false
+	if !sourceBuild && !dryRun && c.Index != "" {
+		loaded, loadErr := binary.LoadIndex(c.Index)
+		if loadErr == nil {
+			index, indexLoaded = loaded, true
+		} else if !os.IsNotExist(loadErr) {
+			fmt.Fprintf(stdout, "repository index unavailable; using source/cache fallback: %v\n", loadErr)
+		}
+	}
+	if !sourceBuild && !dryRun && !indexLoaded && c.RepoURL != "" {
+		indexURL := binary.NormalizeURL(c.RepoURL, "index.json")
+		temp, tempErr := os.CreateTemp("", "pi-index-*.json")
+		if tempErr == nil {
+			tempPath := temp.Name()
+			temp.Close()
+			defer os.Remove(tempPath)
+			if downloadErr := fetch.Download(indexURL, tempPath, 30*time.Second); downloadErr == nil {
+				if loaded, loadErr := binary.LoadIndex(tempPath); loadErr == nil {
+					index, indexLoaded = loaded, true
+				}
+			} else {
+				fmt.Fprintf(stdout, "repository index unavailable; using source/cache fallback: %v\n", downloadErr)
+			}
+		}
+	}
 	for i, name := range graph.Order {
 		r := graph.Nodes[name].Recipe
 		archivePath, source := selectInstallArchive(c.Binpkgs, r)
+		var binaryEntry repoindex.Entry
+		if indexLoaded {
+			_, indexed := repoindex.Find(index, r.Pkgname, c.Arch)
+			if path, entry, resolveErr := binary.Resolve(index, r.Pkgname, c.Arch, c.Binpkgs, stdout); resolveErr == nil {
+				archivePath, binaryEntry, source = path, entry, "repository binary"
+			} else if indexed {
+				archivePath, source = filepath.Join(c.Binpkgs, r.ArchiveName()), "build from PKGBUILD"
+				fmt.Fprintf(stdout, "binary unavailable for %s; falling back to PKGBUILD: %v\n", r.Pkgname, resolveErr)
+			}
+		}
 		record, _ := state.Load(target, r.Pkgname)
 		status := "new install"
 		if record.Pkgname == r.Pkgname && record.Pkgver != "" {
 			status = fmt.Sprintf("already installed (%s-%s -> %s-%s)", record.Pkgver, record.Pkgrel, r.Pkgver, r.Pkgrel)
 		}
-		fmt.Fprintf(stdout, "%d. %s-%s-%s: %s; %s\n", i+1, r.Pkgname, r.Pkgver, r.Pkgrel, status, source)
+		version, release := r.Pkgver, r.Pkgrel
+		if binaryEntry.Pkgver != "" {
+			version, release = binaryEntry.Pkgver, binaryEntry.Pkgrel
+		}
+		fmt.Fprintf(stdout, "%d. %s-%s-%s: %s; %s\n", i+1, r.Pkgname, version, release, status, source)
 		if dryRun {
 			continue
 		}
@@ -414,7 +472,7 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse 
 				return err
 			}
 		}
-		if err := installArchive(c, target, archivePath, state.Record{Pkgname: r.Pkgname, Pkgver: r.Pkgver, Pkgrel: r.Pkgrel, Depends: append(r.Depends, r.MakeDepends...), Backup: r.Backup}, force, false, stdout); err != nil {
+		if err := installArchive(c, target, archivePath, state.Record{Pkgname: r.Pkgname, Pkgver: version, Pkgrel: release, Depends: append(r.Depends, r.MakeDepends...), Backup: r.Backup}, force, false, stdout); err != nil {
 			return err
 		}
 	}

@@ -1,0 +1,41 @@
+package repoindex
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestMergePreservesVersionsAndUpdatesLatest(t *testing.T) {
+	index := New()
+	Merge(&index,
+		Entry{Pkgname: "demo", Pkgver: "1.0", Pkgrel: "1", Arch: "x86_64", Filename: "demo-1.0-1.pkg.tar.zst"},
+		Entry{Pkgname: "demo", Pkgver: "2.0", Pkgrel: "1", Arch: "x86_64", Filename: "demo-2.0-1.pkg.tar.zst"},
+	)
+	if len(index.Packages["demo"].Versions) != 2 || index.Packages["demo"].Latest != "2.0-1" {
+		t.Fatalf("unexpected merged index: %+v", index)
+	}
+	Merge(&index, Entry{Pkgname: "demo", Pkgver: "2.0", Pkgrel: "1", Arch: "x86_64", Filename: "demo-2.0-1.pkg.tar.zst", SHA256: "updated"})
+	if len(index.Packages["demo"].Versions) != 2 || index.Packages["demo"].Versions[1].SHA256 != "updated" {
+		t.Fatalf("duplicate version was not replaced: %+v", index)
+	}
+}
+
+func TestSaveAndLoad(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "repo", "index.json")
+	index := New()
+	Merge(&index, Entry{Pkgname: "demo", Pkgver: "1", Pkgrel: "1", Filename: "demo-1-1.pkg.tar.zst"})
+	if err := Save(path, index); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := Find(loaded, "demo", ""); !ok {
+		t.Fatal("saved entry was not found")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+}
