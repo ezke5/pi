@@ -21,6 +21,12 @@ bin/pi-index --packages ./pkg --index ./pkg/index.json \
   --base-url https://github.com/OWNER/REPO/releases/download/rolling
 ```
 
+`pi-index` reports warnings for empty package directories and filenames that do
+not match `<pkgname>-<pkgver>-<pkgrel>.pkg.tar.zst`; existing index entries are
+preserved in those cases. Package inspection and extraction explicitly require
+zstd-compressed archives and explain when a gzip or other format is being
+used with a `.pkg.tar.zst` name.
+
 Use the published index and assets during installation with
 `--index ./pkg/index.json` or `--repo-url
 https://github.com/OWNER/REPO/releases/download/rolling`. `--source-build`

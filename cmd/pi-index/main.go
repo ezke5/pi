@@ -3,6 +3,8 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -22,48 +24,69 @@ func main() {
 		os.Exit(2)
 	}
 
+	if err := runIndex(*indexPath, *packages, *baseURL, *arch, os.Stderr); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func runIndex(indexPath, packages, baseURL, arch string, stderr io.Writer) error {
+	if baseURL != "" {
+		if err := validateBaseURL(baseURL); err != nil {
+			return err
+		}
+	}
 	index := repoindex.New()
-	if _, err := os.Stat(*indexPath); err == nil {
+	if _, err := os.Stat(indexPath); err == nil {
 		var loadErr error
-		index, loadErr = repoindex.Load(*indexPath)
+		index, loadErr = repoindex.Load(indexPath)
 		if loadErr != nil {
-			fmt.Fprintln(os.Stderr, loadErr)
-			os.Exit(1)
+			return loadErr
 		}
 	} else if !os.IsNotExist(err) {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
-	paths, err := filepath.Glob(filepath.Join(*packages, "*.pkg.tar.zst"))
+	paths, err := filepath.Glob(filepath.Join(packages, "*.pkg.tar.zst"))
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return err
 	}
+	seen := 0
 	for _, path := range paths {
 		name, ver, rel, ok := parseArchive(filepath.Base(path))
 		if !ok {
+			fmt.Fprintf(stderr, "warning: ignoring archive with unexpected filename %q; expected <pkgname>-<pkgver>-<pkgrel>.pkg.tar.zst\n", filepath.Base(path))
 			continue
 		}
 		info, err := os.Stat(path)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			fmt.Fprintf(stderr, "warning: cannot inspect %q: %v\n", path, err)
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			fmt.Fprintf(stderr, "warning: ignoring non-regular package archive %q\n", path)
+			continue
 		}
 		sum, err := repoindex.SHA256(path)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			fmt.Fprintf(stderr, "warning: cannot hash %q: %v\n", path, err)
+			continue
 		}
 		repoindex.Merge(&index, repoindex.Entry{
-			Pkgname: name, Pkgver: ver, Pkgrel: rel, Arch: *arch,
-			Filename: filepath.Base(path), URL: binaryURL(*baseURL, filepath.Base(path)),
+			Pkgname: name, Pkgver: ver, Pkgrel: rel, Arch: arch,
+			Filename: filepath.Base(path), URL: binaryURL(baseURL, filepath.Base(path)),
 			SHA256: sum, Size: info.Size(),
 		})
+		seen++
 	}
-	if err := repoindex.Save(*indexPath, index); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	if len(paths) == 0 {
+		fmt.Fprintf(stderr, "warning: no .pkg.tar.zst archives found in %q; existing index versions were preserved\n", packages)
+	} else if seen == 0 {
+		fmt.Fprintf(stderr, "warning: no valid package archives found in %q; existing index versions were preserved\n", packages)
 	}
+	if err := repoindex.Save(indexPath, index); err != nil {
+		return err
+	}
+	return nil
 }
 
 func defaultArch() string {
@@ -90,4 +113,18 @@ func binaryURL(base, filename string) string {
 		return filename
 	}
 	return strings.TrimRight(base, "/") + "/" + filename
+}
+
+func validateBaseURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid repository base URL %q: %w", raw, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("unsupported repository base URL scheme %q; only http and https are supported", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("repository base URL %q must include a host", raw)
+	}
+	return nil
 }

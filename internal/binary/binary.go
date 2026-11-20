@@ -23,6 +23,9 @@ func Resolve(index repoindex.Index, name, arch, cache string, out io.Writer) (st
 	if !ok {
 		return "", repoindex.Entry{}, fmt.Errorf("package %q is not present in repository index", name)
 	}
+	if filepath.Base(entry.Filename) != entry.Filename || entry.Filename == "." || entry.Filename == ".." {
+		return "", entry, fmt.Errorf("repository index entry %q has an unsafe filename", entry.Filename)
+	}
 	path := filepath.Join(cache, entry.Filename)
 	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
 		if err := repoindex.Verify(path, entry.SHA256); err == nil {
@@ -36,8 +39,12 @@ func Resolve(index repoindex.Index, name, arch, cache string, out io.Writer) (st
 		return "", entry, fmt.Errorf("repository index entry %q has no download URL", entry.Filename)
 	}
 	rawURL := entry.URL
-	if parsed, err := url.Parse(rawURL); err == nil && parsed.Scheme == "" {
-		return "", entry, fmt.Errorf("repository index entry %q has a non-absolute URL", entry.Filename)
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", entry, fmt.Errorf("invalid repository binary URL %q: %w", rawURL, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", entry, fmt.Errorf("unsupported repository binary URL scheme %q for %q; only http and https are supported", parsed.Scheme, rawURL)
 	}
 	if err := fetch.Download(rawURL, path, 30*time.Second); err != nil {
 		return "", entry, err
