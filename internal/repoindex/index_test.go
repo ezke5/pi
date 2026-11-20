@@ -68,3 +68,18 @@ func TestMergeTreatsNoArchAndArchHintAsSameVersion(t *testing.T) {
 		t.Fatalf("incremental architecture merge = %+v", group)
 	}
 }
+
+func TestMergeKeepsSeparateUSEVariantsAndFindsExactState(t *testing.T) {
+	index := New()
+	Merge(&index,
+		Entry{Pkgname: "demo", Pkgver: "1", Pkgrel: "1", Arch: "x86_64", Filename: "demo-wayland.pkg.tar.zst", USEHash: "hash-wayland", USEFlags: []string{"wayland"}},
+		Entry{Pkgname: "demo", Pkgver: "1", Pkgrel: "1", Arch: "x86_64", Filename: "demo-no-wayland.pkg.tar.zst", USEHash: "hash-no-wayland"},
+	)
+	if len(index.Packages["demo"].Versions) != 2 {
+		t.Fatalf("USE variants were not preserved: %+v", index.Packages["demo"])
+	}
+	entry, ok := FindForUSE(index, "demo", "x86_64", "hash-wayland")
+	if !ok || entry.Filename != "demo-wayland.pkg.tar.zst" {
+		t.Fatalf("USE-aware find = %+v, %v", entry, ok)
+	}
+}

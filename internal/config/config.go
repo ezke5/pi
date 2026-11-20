@@ -3,23 +3,58 @@ package config
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 )
 
 type Config struct {
-	Ports   string `ini:"ports"`
-	Work    string `ini:"work"`
-	Temp    string `ini:"temp"`
-	Cache   string `ini:"cache"`
-	Binpkgs string `ini:"binpkgs"`
-	Index   string `ini:"index"`
-	RepoURL string `ini:"repo_url"`
-	Arch    string `ini:"arch"`
-	Root    string `ini:"root"`
-	Config  string `ini:"-"`
+	Ports    string      `ini:"ports"`
+	Work     string      `ini:"work"`
+	Temp     string      `ini:"temp"`
+	Cache    string      `ini:"cache"`
+	Binpkgs  string      `ini:"binpkgs"`
+	Index    string      `ini:"index"`
+	RepoURL  string      `ini:"repo_url"`
+	Arch     string      `ini:"arch"`
+	Root     string      `ini:"root"`
+	Config   string      `ini:"-"`
+	Build    BuildConfig `ini:"-"`
+	Use      UseConfig   `ini:"-"`
+	Jobs     int         `ini:"-"`
+	CFLAGS   string      `ini:"-"`
+	CXXFLAGS string      `ini:"-"`
+	LDFLAGS  string      `ini:"-"`
+	STRIP    string      `ini:"-"`
+}
+
+type BuildConfig struct {
+	Jobs     int
+	CFlags   string
+	CFLAGS   string
+	CXXFlags string
+	CXXFLAGS string
+	LdFlags  string
+	LDFLAGS  string
+	Strip    string
+}
+
+type UseConfig struct {
+	Flags          []string
+	PackageUseFile string
+	PackageUse     map[string][]string
+}
+
+type USEState struct {
+	Enabled   []string
+	Disabled  []string
+	Canonical string
+	Hash      string
 }
 
 func Defaults() Config {
@@ -27,7 +62,9 @@ func Defaults() Config {
 	if err != nil {
 		home = "."
 	}
-	return Config{
+	build := BuildConfig{Jobs: runtime.NumCPU(), CFlags: "", CFLAGS: "", CXXFlags: "", CXXFLAGS: "", LdFlags: "", LDFLAGS: "", Strip: "true"}
+	use := UseConfig{PackageUse: map[string][]string{}}
+	c := Config{
 		Ports:   filepath.Join(".", "ports"),
 		Work:    filepath.Join(".", "work"),
 		Temp:    filepath.Join(".", "temp"),
@@ -36,7 +73,10 @@ func Defaults() Config {
 		Index:   filepath.Join(home, ".pkg", "index.json"),
 		Arch:    "x86_64",
 		Root:    "/",
+		Build:   build, Use: use,
+		Jobs: build.Jobs, CFLAGS: "", CXXFLAGS: "", LDFLAGS: "", STRIP: "true",
 	}
+	return c
 }
 
 // Load reads INI-style key = value configuration. Keys may be in [pi],
@@ -75,7 +115,35 @@ func Load(path string) (Config, error) {
 		}
 		key = strings.ToLower(strings.TrimSpace(key))
 		value = strings.TrimSpace(strings.Trim(value, `"'`))
-		if section != "" && section != "pi" && section != "paths" {
+		if section != "" && section != "pi" && section != "paths" && section != "build" && section != "use" {
+			continue
+		}
+		if section == "build" {
+			switch key {
+			case "jobs":
+				fmt.Sscanf(value, "%d", &c.Build.Jobs)
+				c.Jobs = c.Build.Jobs
+			case "cflags":
+				c.Build.CFlags, c.Build.CFLAGS, c.CFLAGS = value, value, value
+			case "cxxflags":
+				c.Build.CXXFlags, c.Build.CXXFLAGS, c.CXXFLAGS = value, value, value
+			case "ldflags":
+				c.Build.LdFlags, c.Build.LDFLAGS, c.LDFLAGS = value, value, value
+			case "strip":
+				c.Build.Strip, c.STRIP = value, value
+			}
+			continue
+		}
+		if section == "use" {
+			switch key {
+			case "flags":
+				c.Use.Flags = strings.Fields(value)
+			case "package_use_file", "package-use-file", "packageuse":
+				c.Use.PackageUseFile = value
+				if !filepath.IsAbs(value) {
+					c.Use.PackageUseFile = filepath.Join(filepath.Dir(path), value)
+				}
+			}
 			continue
 		}
 		switch key {
@@ -105,8 +173,115 @@ func Load(path string) (Config, error) {
 	if c.Binpkgs == "" {
 		c.Binpkgs = c.Cache
 	}
+	c.syncBuildConvenience()
+	if c.Use.PackageUse == nil {
+		c.Use.PackageUse = map[string][]string{}
+	}
+	if c.Use.PackageUseFile != "" {
+		if err := c.loadPackageUse(); err != nil {
+			return c, err
+		}
+	}
 	return c, nil
 }
+
+func (c *Config) syncBuildConvenience() {
+	if c.Build.CFLAGS == "" {
+		c.Build.CFLAGS = c.Build.CFlags
+	}
+	if c.Build.CXXFLAGS == "" {
+		c.Build.CXXFLAGS = c.Build.CXXFlags
+	}
+	if c.Build.LDFLAGS == "" {
+		c.Build.LDFLAGS = c.Build.LdFlags
+	}
+	if c.Build.Jobs > 0 {
+		c.Jobs = c.Build.Jobs
+	}
+	c.CFLAGS = c.Build.CFLAGS
+	c.CXXFLAGS = c.Build.CXXFLAGS
+	c.LDFLAGS = c.Build.LDFLAGS
+	c.STRIP = c.Build.Strip
+}
+
+func (c *Config) loadPackageUse() error {
+	f, err := os.Open(c.Use.PackageUseFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("open package.use file %q: %w", c.Use.PackageUseFile, err)
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return fmt.Errorf("parse package.use file %q line %d: expected package and USE flags", c.Use.PackageUseFile, lineNo)
+		}
+		pkg := fields[0]
+		c.Use.PackageUse[pkg] = append(c.Use.PackageUse[pkg], fields[1:]...)
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read package.use file %q: %w", c.Use.PackageUseFile, err)
+	}
+	return nil
+}
+
+// ResolveUSE returns the effective enabled and disabled USE flags for pkgname.
+func (c Config) ResolveUSE(pkgname string) USEState {
+	state := USEState{}
+	enabled := map[string]bool{}
+	knownDisabled := map[string]bool{}
+	apply := func(tokens []string) {
+		for _, token := range tokens {
+			token = strings.TrimSpace(token)
+			if token == "" {
+				continue
+			}
+			if strings.HasPrefix(token, "-") {
+				name := strings.TrimPrefix(token, "-")
+				if name != "" {
+					enabled[name] = false
+					knownDisabled[name] = true
+				}
+			} else {
+				enabled[token] = true
+				delete(knownDisabled, token)
+			}
+		}
+	}
+	apply(c.Use.Flags)
+	if overrides := c.Use.PackageUse[pkgname]; len(overrides) > 0 {
+		apply(overrides)
+	}
+	for flag, on := range enabled {
+		if on {
+			state.Enabled = append(state.Enabled, flag)
+		}
+	}
+	for flag := range knownDisabled {
+		if !enabled[flag] {
+			state.Disabled = append(state.Disabled, flag)
+		}
+	}
+	sort.Strings(state.Enabled)
+	sort.Strings(state.Disabled)
+	state.Canonical = "enabled=" + strings.Join(state.Enabled, ",") + ";disabled=" + strings.Join(state.Disabled, ",")
+	sum := sha256.Sum256([]byte(state.Canonical))
+	state.Hash = hex.EncodeToString(sum[:])
+	return state
+}
+
+func (c Config) EffectiveUSE(pkgname string) USEState      { return c.ResolveUSE(pkgname) }
+func (c Config) EffectiveUSEFlags(pkgname string) []string { return c.ResolveUSE(pkgname).Enabled }
+func (c Config) USEHash(pkgname string) string             { return c.ResolveUSE(pkgname).Hash }
 
 // Merge applies non-empty CLI overrides to c.
 func (c *Config) Merge(ports, work, temp, cache, root string) {
@@ -126,6 +301,7 @@ func (c *Config) Merge(ports, work, temp, cache, root string) {
 	if root != "" {
 		c.Root = root
 	}
+	c.syncBuildConvenience()
 }
 
 // EnsureDirs creates writable working directories.

@@ -210,9 +210,21 @@ func cmdInfo(c config.Config, args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	useState := c.ResolveUSE(r.Pkgname)
 	fmt.Fprintf(stdout, "name: %s\nversion: %s-%s\nrecipe: %s\n", r.Pkgname, r.Pkgver, r.Pkgrel, r.Path)
 	fmt.Fprintf(stdout, "sources: %d\ndependencies: %d\n", len(r.Source), len(r.Depends))
+	fmt.Fprintf(stdout, "use: %s\nuse_disabled: %s\nuse_hash: %s\n", strings.Join(useState.Enabled, " "), strings.Join(useState.Disabled, " "), useState.Hash)
+	fmt.Fprintf(stdout, "build: jobs=%d cflags=%q cxxflags=%q ldflags=%q strip=%q (config: %s)\n",
+		c.Build.Jobs, c.Build.CFLAGS, c.Build.CXXFLAGS, c.Build.LDFLAGS, c.Build.Strip, buildConfigSource(c))
+	fmt.Fprintf(stdout, "build_source: PKGBUILD (%s)\n", r.Path)
 	return nil
+}
+
+func buildConfigSource(c config.Config) string {
+	if c.Config != "" {
+		return c.Config
+	}
+	return "defaults"
 }
 
 func cmdBuild(c config.Config, args []string, reuse bool, dryRun bool, stdout io.Writer) error {
@@ -279,6 +291,29 @@ func cmdBuildRecipe(c config.Config, r pkgbuild.Recipe, reuse bool, stdout io.Wr
 	}
 
 	cmdScript := "#!/bin/bash\nset -e\n" + fmt.Sprintf("unset CONFIG_SITE\nexport pkgname=%q\nexport pkgver=%q\nexport pkgrel=%q\nexport srcdir=%q\nexport pkgdir=%q\n", r.Pkgname, r.Pkgver, r.Pkgrel, srcDir, pkgDir)
+	useState := c.ResolveUSE(r.Pkgname)
+	jobs, cflags, cxxflags, ldflags, strip := c.Build.Jobs, c.Build.CFLAGS, c.Build.CXXFLAGS, c.Build.LDFLAGS, c.Build.Strip
+	if jobs == 0 {
+		jobs = c.Jobs
+	}
+	if cflags == "" {
+		cflags = c.CFLAGS
+	}
+	if cxxflags == "" {
+		cxxflags = c.CXXFLAGS
+	}
+	if ldflags == "" {
+		ldflags = c.LDFLAGS
+	}
+	if strip == "" {
+		strip = c.STRIP
+	}
+	cmdScript += fmt.Sprintf("export JOBS=%q\nexport CFLAGS=%q\nexport CXXFLAGS=%q\nexport LDFLAGS=%q\nexport STRIP=%q\n",
+		fmt.Sprintf("%d", jobs), cflags, cxxflags, ldflags, strip)
+	cmdScript += fmt.Sprintf("export PI_USE_FLAGS=%q\nexport PI_USE_DISABLED=%q\nexport PI_USE_HASH=%q\n",
+		strings.Join(useState.Enabled, " "), strings.Join(useState.Disabled, " "), useState.Hash)
+	cmdScript += "use_enabled() { case \" $PI_USE_FLAGS \" in *\" $1 \"*) return 0;; *) return 1;; esac; }\n"
+	cmdScript += "use_disabled() { case \" $PI_USE_DISABLED \" in *\" $1 \"*) return 0;; *) return 1;; esac; }\n"
 	cmdScript += "cd \"$srcdir\"\n"
 	if r.BuildFunction != "" {
 		cmdScript += "build() {\n" + r.BuildFunction + "\n}\n"
@@ -309,7 +344,9 @@ func cmdBuildRecipe(c config.Config, r pkgbuild.Recipe, reuse bool, stdout io.Wr
 		return err
 	}
 	output := filepath.Join(c.Binpkgs, r.ArchiveName())
-	if err := archive.Create(pkgDir, output, r.Pkgname, r.Pkgver, r.Pkgrel, entries, r.Backup); err != nil {
+	useState = c.ResolveUSE(r.Pkgname)
+	if err := archive.CreateWithUSE(pkgDir, output, r.Pkgname, r.Pkgver, r.Pkgrel, c.Arch,
+		useState.Enabled, useState.Disabled, useState.Hash, entries, r.Backup); err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "built %s\n", output)
@@ -350,6 +387,12 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse,
 		record := state.Record{}
 		if infoErr == nil {
 			record = state.Record{Pkgname: info.Pkgname, Pkgver: info.Pkgver, Pkgrel: info.Pkgrel, Backup: info.Backup, Depends: info.Depends}
+			if info.USEHash != "" {
+				targetUSE := c.ResolveUSE(info.Pkgname)
+				if targetUSE.Hash != info.USEHash {
+					return fmt.Errorf("package archive %q USE hash mismatch: archive %s, requested %s", archivePath, info.USEHash, targetUSE.Hash)
+				}
+			}
 		} else {
 			base := strings.TrimSuffix(filepath.Base(archivePath), ".pkg.tar.zst")
 			record.Pkgname = base
@@ -367,12 +410,16 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse,
 		}
 		return installArchive(c, target, archivePath, record, force, false, stdout)
 	}
-	if archivePath := findPackageArchive(c.Binpkgs, args[0]); archivePath != "" {
+	useHash := c.ResolveUSE(args[0]).Hash
+	if archivePath := findPackageArchiveForUSE(c.Binpkgs, args[0], c.Arch, useHash); archivePath != "" {
 		if _, statErr := os.Stat(filepath.Join(c.Ports, args[0], "PKGBUILD")); statErr != nil {
 			info, infoErr := archive.ReadInfo(archivePath)
 			record := state.Record{Pkgname: args[0]}
 			if infoErr == nil {
 				record = state.Record{Pkgname: info.Pkgname, Pkgver: info.Pkgver, Pkgrel: info.Pkgrel, Backup: info.Backup, Depends: info.Depends}
+				if info.USEHash != "" && c.ResolveUSE(record.Pkgname).Hash != info.USEHash {
+					return fmt.Errorf("package archive %q USE hash mismatch: archive %s, requested %s", archivePath, info.USEHash, c.ResolveUSE(record.Pkgname).Hash)
+				}
 			}
 			status := "new install"
 			if record.Pkgname != "" {
@@ -390,7 +437,7 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse,
 	}
 	graph, err := (deps.Resolver{Ports: c.Ports}).Resolve(args[0])
 	if err != nil {
-		archivePath := findPackageArchive(c.Binpkgs, args[0])
+		archivePath := findPackageArchiveForUSE(c.Binpkgs, args[0], c.Arch, c.ResolveUSE(args[0]).Hash)
 		if archivePath == "" {
 			return err
 		}
@@ -440,19 +487,20 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse,
 	}
 	for i, name := range graph.Order {
 		r := graph.Nodes[name].Recipe
-		archivePath, source := selectInstallArchive(c.Binpkgs, r)
+		useState := c.ResolveUSE(r.Pkgname)
+		archivePath, source := selectInstallArchiveForUSE(c.Binpkgs, r, c.Arch, useState.Hash)
 		var binaryEntry repoindex.Entry
 		if indexLoaded {
-			if entry, ok := repoindex.Find(index, r.Pkgname, c.Arch); ok {
+			if entry, ok := repoindex.FindForUSE(index, r.Pkgname, c.Arch, useState.Hash); ok {
 				cachedPath := filepath.Join(c.Binpkgs, entry.Filename)
-				if verifyErr := repoindex.Verify(cachedPath, entry.SHA256); verifyErr == nil {
+				if verifyErr := binary.VerifyUSE(cachedPath, entry, useState.Hash); verifyErr == nil {
 					archivePath, binaryEntry, source = cachedPath, entry, "repository binary"
 				} else {
 					if dryRun {
 						archivePath, source = filepath.Join(c.Binpkgs, r.ArchiveName()), "build from PKGBUILD"
 						fmt.Fprintf(stdout, "binary unavailable in cache for %s; dry-run would fall back to PKGBUILD\n", r.Pkgname)
 					} else {
-						if resolvedPath, resolvedEntry, resolveErr := binary.Resolve(index, r.Pkgname, c.Arch, c.Binpkgs, stdout); resolveErr == nil {
+						if resolvedPath, resolvedEntry, resolveErr := binary.ResolveForUSE(index, r.Pkgname, c.Arch, useState.Hash, c.Binpkgs, stdout); resolveErr == nil {
 							archivePath, binaryEntry, source = resolvedPath, resolvedEntry, "repository binary"
 						} else {
 							archivePath, source = filepath.Join(c.Binpkgs, r.ArchiveName()), "build from PKGBUILD"
@@ -471,7 +519,9 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse,
 		if binaryEntry.Pkgver != "" {
 			version, release = binaryEntry.Pkgver, binaryEntry.Pkgrel
 		}
-		fmt.Fprintf(stdout, "%d. %s-%s-%s: %s; %s\n", i+1, r.Pkgname, version, release, status, source)
+		fmt.Fprintf(stdout, "%d. %s-%s-%s: %s; %s; use=%s; use_disabled=%s; use_hash=%s\n",
+			i+1, r.Pkgname, version, release, status, source,
+			strings.Join(useState.Enabled, " "), strings.Join(useState.Disabled, " "), useState.Hash)
 		if dryRun {
 			continue
 		}
@@ -589,6 +639,31 @@ func findPackageArchive(dir, name string) string {
 	return matches[len(matches)-1]
 }
 
+func findPackageArchiveForUSE(dir, name, arch, useHash string) string {
+	matches, _ := filepath.Glob(filepath.Join(dir, name+"-*.pkg.tar.zst"))
+	sort.Slice(matches, func(i, j int) bool {
+		return comparePackageVersions(packageVersion(filepath.Base(matches[i]), name), packageVersion(filepath.Base(matches[j]), name)) < 0
+	})
+	for i := len(matches) - 1; i >= 0; i-- {
+		path := matches[i]
+		if !isRegularFile(path) {
+			continue
+		}
+		info, err := archive.ReadInfo(path)
+		if err != nil {
+			return path
+		}
+		if info.USEHash != "" && useHash != "" && info.USEHash != useHash {
+			continue
+		}
+		if info.Arch != "" && arch != "" && info.Arch != arch {
+			continue
+		}
+		return path
+	}
+	return ""
+}
+
 func selectInstallArchive(cache string, recipe pkgbuild.Recipe) (string, string) {
 	exact := filepath.Join(cache, recipe.ArchiveName())
 	if isRegularFile(exact) {
@@ -598,6 +673,30 @@ func selectInstallArchive(cache string, recipe pkgbuild.Recipe) (string, string)
 		return archivePath, "existing archive"
 	}
 	return exact, "build from PKGBUILD"
+}
+
+func selectInstallArchiveForUSE(cache string, recipe pkgbuild.Recipe, arch, useHash string) (string, string) {
+	candidates := []string{filepath.Join(cache, recipe.ArchiveName())}
+	if matches, _ := filepath.Glob(filepath.Join(cache, recipe.Pkgname+"-*.pkg.tar.zst")); len(matches) > 0 {
+		candidates = append(candidates, matches...)
+	}
+	for _, path := range candidates {
+		if !isRegularFile(path) {
+			continue
+		}
+		info, err := archive.ReadInfo(path)
+		if err != nil {
+			return path, "existing archive" // legacy archive without metadata
+		}
+		if info.USEHash != "" && useHash != "" && info.USEHash != useHash {
+			continue
+		}
+		if info.Arch != "" && arch != "" && info.Arch != arch {
+			continue
+		}
+		return path, "existing archive"
+	}
+	return filepath.Join(cache, recipe.ArchiveName()), "build from PKGBUILD"
 }
 
 func filterRegularFiles(paths []string) []string {

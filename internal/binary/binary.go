@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ezke5/pi/internal/archive"
 	"github.com/ezke5/pi/internal/fetch"
 	"github.com/ezke5/pi/internal/repoindex"
 )
@@ -19,7 +20,13 @@ func LoadIndex(path string) (repoindex.Index, error) {
 }
 
 func Resolve(index repoindex.Index, name, arch, cache string, out io.Writer) (string, repoindex.Entry, error) {
-	entry, ok := repoindex.Find(index, name, arch)
+	return ResolveForUSE(index, name, arch, "", cache, out)
+}
+
+// ResolveForUSE resolves only a binary matching arch and effective USE hash.
+// An entry with no USE metadata is treated as a legacy, backward-compatible entry.
+func ResolveForUSE(index repoindex.Index, name, arch, useHash, cache string, out io.Writer) (string, repoindex.Entry, error) {
+	entry, ok := repoindex.FindForUSE(index, name, arch, useHash)
 	if !ok {
 		return "", repoindex.Entry{}, fmt.Errorf("package %q is not present in repository index", name)
 	}
@@ -28,7 +35,7 @@ func Resolve(index repoindex.Index, name, arch, cache string, out io.Writer) (st
 	}
 	path := filepath.Join(cache, entry.Filename)
 	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
-		if err := repoindex.Verify(path, entry.SHA256); err == nil {
+		if err := VerifyUSE(path, entry, useHash); err == nil {
 			return path, entry, nil
 		} else {
 			_ = os.Remove(path)
@@ -49,7 +56,7 @@ func Resolve(index repoindex.Index, name, arch, cache string, out io.Writer) (st
 	if err := fetch.Download(rawURL, path, 30*time.Second); err != nil {
 		return "", entry, err
 	}
-	if err := repoindex.Verify(path, entry.SHA256); err != nil {
+	if err := VerifyUSE(path, entry, useHash); err != nil {
 		_ = os.Remove(path)
 		return "", entry, err
 	}
@@ -62,4 +69,21 @@ func NormalizeURL(baseURL, filename string) string {
 		return filename
 	}
 	return strings.TrimRight(baseURL, "/") + "/" + strings.TrimLeft(filename, "/")
+}
+
+func VerifyUSE(path string, entry repoindex.Entry, useHash string) error {
+	if err := repoindex.Verify(path, entry.SHA256); err != nil {
+		return err
+	}
+	info, err := archive.ReadInfo(path)
+	if err != nil {
+		return nil // legacy archive metadata is unavailable
+	}
+	if info.USEHash != "" && useHash != "" && info.USEHash != useHash {
+		return fmt.Errorf("USE mismatch for %q: expected %s, got %s", path, useHash, info.USEHash)
+	}
+	if entry.USEHash != "" && info.USEHash != "" && info.USEHash != entry.USEHash {
+		return fmt.Errorf("USE mismatch for %q: index expects %s, archive has %s", path, entry.USEHash, info.USEHash)
+	}
+	return nil
 }
