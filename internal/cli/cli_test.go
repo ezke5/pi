@@ -456,3 +456,214 @@ package() {
 		t.Fatalf("expected package archive %s to be created: %v", archivePath, err)
 	}
 }
+
+func TestSmartSkipOnMatchingVersionAndUSEHashAndRebuild(t *testing.T) {
+	if _, err := exec.LookPath("zstd"); err != nil {
+		t.Skip("zstd is required for package archive creation")
+	}
+	root := t.TempDir()
+	ports := filepath.Join(root, "ports")
+	work := filepath.Join(root, "work")
+	temp := filepath.Join(root, "temp")
+	cache := filepath.Join(root, "cache")
+	target := filepath.Join(root, "target")
+	recipeDir := filepath.Join(ports, "demo")
+	buildCounter := filepath.Join(root, "build-count.log")
+	for _, dir := range []string{recipeDir, work, temp, cache} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recipe := `pkgname=demo
+pkgver=1.0
+pkgrel=1
+package() {
+  echo build >> "` + buildCounter + `"
+  mkdir -p "$pkgdir/usr/share"
+  printf '%s' "$PI_USE_FLAGS" > "$pkgdir/usr/share/demo-use"
+}
+`
+	if err := os.WriteFile(filepath.Join(recipeDir, "PKGBUILD"), []byte(recipe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(root, "pi.ini")
+	baseCfg := "[paths]\nports = " + ports + "\nwork = " + work + "\ntemp = " + temp + "\ncache = " + cache + "\nbinpkgs = " + cache + "\nroot = " + target + "\n\n[use]\n"
+	if err := os.WriteFile(cfgPath, []byte(baseCfg+"flags = readline\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	buildCount := func() int {
+		data, err := os.ReadFile(buildCounter)
+		if err != nil {
+			return 0
+		}
+		trimmed := strings.TrimSpace(string(data))
+		if trimmed == "" {
+			return 0
+		}
+		return len(strings.Split(trimmed, "\n"))
+	}
+
+	// 1. Initial install builds and installs package.
+	var output bytes.Buffer
+	if err := Run([]string{"--config", cfgPath, "install", "demo"}, &output, &output); err != nil {
+		t.Fatalf("initial install failed: %v\n%s", err, output.String())
+	}
+	if buildCount() != 1 {
+		t.Fatalf("buildCount after initial install = %d, want 1", buildCount())
+	}
+	gotUse, err := os.ReadFile(filepath.Join(target, "usr", "share", "demo-use"))
+	if err != nil || string(gotUse) != "readline" {
+		t.Fatalf("installed USE file = %q, err=%v", gotUse, err)
+	}
+
+	// 2. Repeat install with identical version + use_hash skips cleanly.
+	output.Reset()
+	if err := Run([]string{"--config", cfgPath, "install", "demo"}, &output, &output); err != nil {
+		t.Fatalf("second install failed: %v\n%s", err, output.String())
+	}
+	if !strings.Contains(output.String(), "skipping") || buildCount() != 1 {
+		t.Fatalf("expected smart skip on repeat install: buildCount=%d output=%s", buildCount(), output.String())
+	}
+
+	// 3. Repeat build with matching installed version + use_hash in target root also skips.
+	output.Reset()
+	if err := Run([]string{"--config", cfgPath, "build", "demo"}, &output, &output); err != nil {
+		t.Fatalf("repeat build failed: %v\n%s", err, output.String())
+	}
+	if !strings.Contains(output.String(), "skipping") || buildCount() != 1 {
+		t.Fatalf("expected smart skip on repeat build: buildCount=%d output=%s", buildCount(), output.String())
+	}
+
+	// 4. Changing USE flags changes use_hash and triggers rebuild + reinstall.
+	if err := os.WriteFile(cfgPath, []byte(baseCfg+"flags = readline nls\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	if err := Run([]string{"--config", cfgPath, "install", "demo"}, &output, &output); err != nil {
+		t.Fatalf("USE-changed install failed: %v\n%s", err, output.String())
+	}
+	if buildCount() != 2 {
+		t.Fatalf("buildCount after USE change = %d, want 2\n%s", buildCount(), output.String())
+	}
+	gotUse, err = os.ReadFile(filepath.Join(target, "usr", "share", "demo-use"))
+	if err != nil || string(gotUse) != "nls readline" {
+		t.Fatalf("updated USE file = %q, err=%v", gotUse, err)
+	}
+
+	// 5. --rebuild forces rebuild and reinstall even when version + use_hash match.
+	output.Reset()
+	if err := Run([]string{"--config", cfgPath, "--rebuild", "install", "demo"}, &output, &output); err != nil {
+		t.Fatalf("--rebuild install failed: %v\n%s", err, output.String())
+	}
+	if buildCount() != 3 {
+		t.Fatalf("buildCount after --rebuild = %d, want 3\n%s", buildCount(), output.String())
+	}
+
+	// 6. Unreadable (permission error) or missing installed file disables skip and repairs.
+	demoUseFile := filepath.Join(target, "usr", "share", "demo-use")
+	if err := os.Chmod(demoUseFile, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	if err := Run([]string{"--config", cfgPath, "install", "demo"}, &output, &output); err != nil {
+		t.Fatalf("permission-repair install failed: %v\n%s", err, output.String())
+	}
+	if strings.Contains(output.String(), "skipping") {
+		t.Fatalf("expected reinstall when installed file has permission error, got: %s", output.String())
+	}
+	if _, err := os.ReadFile(demoUseFile); err != nil {
+		t.Fatalf("repaired installed file should be readable: %v", err)
+	}
+
+	if err := os.Remove(demoUseFile); err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	if err := Run([]string{"--config", cfgPath, "install", "demo"}, &output, &output); err != nil {
+		t.Fatalf("repair install failed: %v\n%s", err, output.String())
+	}
+	if strings.Contains(output.String(), "skipping") {
+		t.Fatalf("expected repair install when file is missing, got: %s", output.String())
+	}
+	if _, err := os.Stat(demoUseFile); err != nil {
+		t.Fatalf("missing installed file was not restored: %v", err)
+	}
+}
+
+func TestBootstrapSubcommandAndPreInstallSkeleton(t *testing.T) {
+	if _, err := exec.LookPath("zstd"); err != nil {
+		t.Skip("zstd is required for package archive creation")
+	}
+	root := t.TempDir()
+	bootstrapRoot := filepath.Join(root, "bootstrapped")
+
+	var output bytes.Buffer
+	if err := Run([]string{"--root", bootstrapRoot, "--dry-run", "bootstrap"}, &output, &output); err != nil {
+		t.Fatalf("dry-run bootstrap failed: %v", err)
+	}
+	if _, err := os.Stat(bootstrapRoot); !os.IsNotExist(err) {
+		t.Fatalf("dry-run bootstrap created target directory: %v", err)
+	}
+
+	output.Reset()
+	if err := Run([]string{"--root", bootstrapRoot, "bootstrap"}, &output, &output); err != nil {
+		t.Fatalf("bootstrap failed: %v", err)
+	}
+	for _, rel := range []string{"usr/bin", "usr/lib", "usr/lib64", "etc/passwd", "etc/group", "dev", "proc", "sys", "tmp", "var"} {
+		if _, err := os.Stat(filepath.Join(bootstrapRoot, rel)); err != nil {
+			t.Fatalf("missing bootstrapped path %s: %v", rel, err)
+		}
+	}
+
+	// Installing into an empty target root automatically creates the FHS skeleton.
+	installRoot := filepath.Join(root, "install-target")
+	pkgDir := filepath.Join(root, "pkg")
+	cache := filepath.Join(root, "cache")
+	if err := os.MkdirAll(filepath.Join(pkgDir, "usr", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "usr", "bin", "hello"), []byte("hi"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := footprint.Generate(pkgDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archivePath := filepath.Join(cache, "hello-1-1.pkg.tar.zst")
+	if err := archive.Create(pkgDir, archivePath, "hello", "1", "1", entries); err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	if err := Run([]string{"--root", installRoot, "--cache", cache, "install", archivePath}, &output, &output); err != nil {
+		t.Fatalf("install into empty root failed: %v\n%s", err, output.String())
+	}
+	for _, rel := range []string{"usr/bin/hello", "usr/lib64", "etc/passwd", "etc/group", "proc", "sys"} {
+		if _, err := os.Stat(filepath.Join(installRoot, rel)); err != nil {
+			t.Fatalf("expected skeleton/installed path %s: %v", rel, err)
+		}
+	}
+}
+
+func TestChrootSubcommandDryRunAndFlagSplitting(t *testing.T) {
+	global, rest := splitFlags([]string{"--root", "/srv/crux", "chroot", "/bin/bash", "--noprofile", "--force"})
+	if strings.Join(global, " ") != "--root /srv/crux" {
+		t.Fatalf("chroot global flags = %v", global)
+	}
+	if strings.Join(rest, " ") != "chroot /bin/bash --noprofile --force" {
+		t.Fatalf("chroot rest args = %v", rest)
+	}
+
+	target := t.TempDir()
+	var output bytes.Buffer
+	if err := Run([]string{"--root", target, "--dry-run", "chroot", "/bin/sh", "-c", "echo ok"}, &output, &output); err != nil {
+		t.Fatalf("dry-run chroot failed: %v", err)
+	}
+	if !strings.Contains(output.String(), "dry-run: chroot "+target+" (/bin/sh -c echo ok)") {
+		t.Fatalf("unexpected dry-run chroot output: %s", output.String())
+	}
+
+	if err := Run([]string{"--root", "/", "--allow-host-root", "chroot", "/bin/sh"}, &output, &output); err == nil {
+		t.Fatal("expected chroot into host root / to be rejected")
+	}
+}

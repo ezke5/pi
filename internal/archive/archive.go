@@ -136,7 +136,16 @@ func CreateWithUSE(pkgDir, output, pkgname, pkgver, pkgrel, arch string, useFlag
 			metadata += fmt.Sprintf("backup = %s\n", backup)
 		}
 	}
-	hdr := &tar.Header{Name: ".PKGINFO", Mode: 0o644, Size: int64(len(metadata)), Typeflag: tar.TypeReg}
+	hdr := &tar.Header{
+		Name:     ".PKGINFO",
+		Mode:     0o644,
+		Size:     int64(len(metadata)),
+		Typeflag: tar.TypeReg,
+		Uid:      0,
+		Gid:      0,
+		Uname:    "root",
+		Gname:    "root",
+	}
 	if err := tw.WriteHeader(hdr); err != nil {
 		return fmt.Errorf("write .PKGINFO header: %w", err)
 	}
@@ -161,6 +170,10 @@ func CreateWithUSE(pkgDir, output, pkgname, pkgver, pkgrel, arch string, useFlag
 			return fmt.Errorf("create tar header for %q: %w", path, err)
 		}
 		hdr.Name = name
+		hdr.Uid = 0
+		hdr.Gid = 0
+		hdr.Uname = "root"
+		hdr.Gname = "root"
 		if info.Mode()&os.ModeSymlink != 0 {
 			target, err := os.Readlink(path)
 			if err != nil {
@@ -278,7 +291,21 @@ func Extract(output string, archivePath, destRoot string) error {
 			if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 				return fmt.Errorf("create package file directory %q: %w", filepath.Dir(dest), err)
 			}
-			out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
+			if existing, statErr := os.Lstat(dest); statErr == nil {
+				if existing.Mode()&os.ModeSymlink != 0 {
+					if err := os.Remove(dest); err != nil {
+						return fmt.Errorf("replace existing symlink %q: %w", dest, err)
+					}
+				} else if existing.Mode().Perm()&0o200 == 0 {
+					if err := os.Chmod(dest, existing.Mode().Perm()|0o200); err != nil {
+						return fmt.Errorf("make existing package file writable %q: %w", dest, err)
+					}
+				}
+			} else if !os.IsNotExist(statErr) {
+				return fmt.Errorf("inspect existing package file %q: %w", dest, statErr)
+			}
+			finalMode := hdr.FileInfo().Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
+			out, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, finalMode.Perm()|0o200)
 			if err != nil {
 				return fmt.Errorf("create package file %q: %w", dest, err)
 			}
@@ -289,6 +316,9 @@ func Extract(output string, archivePath, destRoot string) error {
 			}
 			if closeErr != nil {
 				return fmt.Errorf("close package file %q: %w", dest, closeErr)
+			}
+			if err := os.Chmod(dest, finalMode); err != nil {
+				return fmt.Errorf("set package file mode %q: %w", dest, err)
 			}
 		}
 	}

@@ -14,11 +14,15 @@ import (
 )
 
 type Record struct {
-	Pkgname string   `json:"pkgname"`
-	Pkgver  string   `json:"pkgver"`
-	Pkgrel  string   `json:"pkgrel"`
-	Depends []string `json:"depends,omitempty"`
-	Backup  []string `json:"backup,omitempty"`
+	Pkgname     string   `json:"pkgname"`
+	Pkgver      string   `json:"pkgver"`
+	Pkgrel      string   `json:"pkgrel"`
+	Arch        string   `json:"arch,omitempty"`
+	USEFlags    []string `json:"use_flags,omitempty"`
+	USEDisabled []string `json:"use_disabled,omitempty"`
+	USEHash     string   `json:"use_hash,omitempty"`
+	Depends     []string `json:"depends,omitempty"`
+	Backup      []string `json:"backup,omitempty"`
 }
 
 func RecordDir(root string) (string, error) {
@@ -131,4 +135,78 @@ func OwnedByOthers(root, name string, path string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// VerifyInstalled checks whether name is already installed in root at the exact
+// expected version-release and USE hash, and whether all recorded footprint
+// entries exist on disk without permission or integrity errors.
+func VerifyInstalled(root, name, expectedVer, expectedRel, expectedUSEHash string) (bool, string) {
+	if root == "" || name == "" || expectedVer == "" {
+		return false, "incomplete package identity"
+	}
+	record, err := Load(root, name)
+	if err != nil {
+		return false, fmt.Sprintf("read metadata: %v", err)
+	}
+	if record.Pkgver == "" {
+		return false, "not installed"
+	}
+	if record.Pkgver != expectedVer || record.Pkgrel != expectedRel {
+		return false, fmt.Sprintf("installed version %s-%s differs from %s-%s", record.Pkgver, record.Pkgrel, expectedVer, expectedRel)
+	}
+	if expectedUSEHash != "" && record.USEHash != expectedUSEHash {
+		return false, fmt.Sprintf("USE hash changed (%q -> %q)", record.USEHash, expectedUSEHash)
+	}
+	dir, err := RecordDir(root)
+	if err != nil {
+		return false, fmt.Sprintf("resolve metadata dir: %v", err)
+	}
+	footprintPath := filepath.Join(dir, name+".footprint")
+	if _, err := os.Stat(footprintPath); err != nil {
+		return false, fmt.Sprintf("missing footprint: %v", err)
+	}
+	entries, err := Footprint(root, name)
+	if err != nil {
+		return false, fmt.Sprintf("read footprint: %v", err)
+	}
+	for _, entry := range entries {
+		targetPath, err := rootfs.TargetPath(root, entry.Path)
+		if err != nil {
+			return false, fmt.Sprintf("invalid footprint path %q: %v", entry.Path, err)
+		}
+		info, err := os.Lstat(targetPath)
+		if err != nil {
+			return false, fmt.Sprintf("inspect installed path %q: %v", entry.Path, err)
+		}
+		switch entry.Type {
+		case "dir":
+			if !info.IsDir() {
+				return false, fmt.Sprintf("installed path %q is not a directory", entry.Path)
+			}
+		case "symlink":
+			if info.Mode()&os.ModeSymlink == 0 {
+				return false, fmt.Sprintf("installed path %q is not a symlink", entry.Path)
+			}
+			linkTarget, err := os.Readlink(targetPath)
+			if err != nil {
+				return false, fmt.Sprintf("read installed symlink %q: %v", entry.Path, err)
+			}
+			if entry.LinkTarget != "" && linkTarget != entry.LinkTarget {
+				return false, fmt.Sprintf("installed symlink %q target %q differs from %q", entry.Path, linkTarget, entry.LinkTarget)
+			}
+		default:
+			if !info.Mode().IsRegular() {
+				return false, fmt.Sprintf("installed path %q is not a regular file", entry.Path)
+			}
+			if info.Mode().Perm() == 0 {
+				return false, fmt.Sprintf("installed file %q has zero permissions", entry.Path)
+			}
+			f, err := os.Open(targetPath)
+			if err != nil {
+				return false, fmt.Sprintf("open installed file %q: %v", entry.Path, err)
+			}
+			_ = f.Close()
+		}
+	}
+	return true, ""
 }
