@@ -24,14 +24,38 @@ type Package struct {
 }
 
 type Entry struct {
-	Pkgname  string `json:"pkgname"`
-	Pkgver   string `json:"pkgver"`
-	Pkgrel   string `json:"pkgrel"`
-	Arch     string `json:"arch"`
-	Filename string `json:"filename"`
-	URL      string `json:"url"`
-	SHA256   string `json:"sha256"`
-	Size     int64  `json:"size"`
+	Pkgname     string   `json:"pkgname"`
+	Pkgver      string   `json:"pkgver"`
+	Pkgrel      string   `json:"pkgrel"`
+	Arch        string   `json:"arch"`
+	Filename    string   `json:"filename"`
+	URL         string   `json:"url"`
+	SHA256      string   `json:"sha256"`
+	Size        int64    `json:"size"`
+	USEFlags    []string `json:"use_flags,omitempty"`
+	USEDisabled []string `json:"use_disabled,omitempty"`
+	USEHash     string   `json:"use_hash,omitempty"`
+	USE         []string `json:"use,omitempty"`
+	UseTags     []string `json:"use_tags,omitempty"`
+}
+
+func (e *Entry) normalizeUSE() {
+	if len(e.USEFlags) == 0 {
+		e.USEFlags = append(e.USEFlags, e.USE...)
+	}
+	if len(e.USEFlags) == 0 {
+		e.USEFlags = append(e.USEFlags, e.UseTags...)
+	}
+	if len(e.USE) == 0 {
+		e.USE = append(e.USE, e.USEFlags...)
+	}
+	if len(e.UseTags) == 0 {
+		e.UseTags = append(e.UseTags, e.USEFlags...)
+	}
+	sort.Strings(e.USEFlags)
+	sort.Strings(e.USEDisabled)
+	sort.Strings(e.USE)
+	sort.Strings(e.UseTags)
 }
 
 func New() Index { return Index{SchemaVersion: 1, Packages: map[string]Package{}} }
@@ -99,11 +123,14 @@ func Merge(index *Index, entries ...Entry) {
 		if entry.Pkgname == "" || entry.Filename == "" {
 			continue
 		}
+		entry.normalizeUSE()
 		group := index.Packages[entry.Pkgname]
 		replaced := false
 		for i, old := range group.Versions {
 			sameArch := old.Arch == entry.Arch || old.Arch == "" || entry.Arch == ""
-			if old.Pkgver == entry.Pkgver && old.Pkgrel == entry.Pkgrel && sameArch {
+			old.normalizeUSE()
+			sameUSE := old.USEHash == entry.USEHash
+			if old.Pkgver == entry.Pkgver && old.Pkgrel == entry.Pkgrel && sameArch && sameUSE {
 				if entry.Arch == "" {
 					entry.Arch = old.Arch
 				}
@@ -135,6 +162,40 @@ func Find(index Index, name, arch string) (Entry, bool) {
 		if arch == "" || group.Versions[i].Arch == "" || group.Versions[i].Arch == arch {
 			return group.Versions[i], true
 		}
+	}
+	return Entry{}, false
+}
+
+// FindForUSE selects a binary for the requested architecture and USE state.
+// Entries with no USE metadata are legacy entries and remain usable.
+func FindForUSE(index Index, name, arch, useHash string) (Entry, bool) {
+	group, ok := index.Packages[name]
+	if !ok {
+		return Entry{}, false
+	}
+	var legacy *Entry
+	for i := len(group.Versions) - 1; i >= 0; i-- {
+		entry := group.Versions[i]
+		entry.normalizeUSE()
+		if arch != "" && entry.Arch != "" && entry.Arch != arch {
+			continue
+		}
+		if useHash != "" && entry.USEHash != "" {
+			if entry.USEHash == useHash {
+				return entry, true
+			}
+			continue
+		}
+		if entry.USEHash == "" && len(entry.USEFlags) == 0 && len(entry.USEDisabled) == 0 {
+			copy := entry
+			legacy = &copy
+		}
+	}
+	if legacy != nil {
+		return *legacy, true
+	}
+	if useHash == "" {
+		return Find(index, name, arch)
 	}
 	return Entry{}, false
 }

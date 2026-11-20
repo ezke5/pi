@@ -72,6 +72,8 @@ func runIndex(indexPath, packages, baseURL, arch string, stderr io.Writer) error
 			fmt.Fprintf(stderr, "warning: cannot hash %q: %v\n", path, err)
 			continue
 		}
+		var useFlags, useDisabled []string
+		var useHash string
 		if info, metadataErr := archive.ReadInfo(path); metadataErr == nil {
 			if info.Pkgname != "" {
 				name = info.Pkgname
@@ -82,6 +84,12 @@ func runIndex(indexPath, packages, baseURL, arch string, stderr io.Writer) error
 			if info.Pkgrel != "" {
 				rel = info.Pkgrel
 			}
+			if info.Arch != "" {
+				parsedArch = info.Arch
+			}
+			useFlags = info.USEFlags
+			useDisabled = info.USEDisabled
+			useHash = info.USEHash
 		}
 		if parsedArch == "" {
 			parsedArch = arch
@@ -90,6 +98,7 @@ func runIndex(indexPath, packages, baseURL, arch string, stderr io.Writer) error
 			Pkgname: name, Pkgver: ver, Pkgrel: rel, Arch: parsedArch,
 			Filename: filepath.Base(path), URL: binaryURL(baseURL, filepath.Base(path)),
 			SHA256: sum, Size: info.Size(),
+			USEFlags: useFlags, USEDisabled: useDisabled, USEHash: useHash,
 		})
 		seen++
 	}

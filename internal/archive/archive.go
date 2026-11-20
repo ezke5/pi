@@ -54,6 +54,12 @@ func safeSymlinkTarget(root, symlinkPath, target string) (string, error) {
 }
 
 func Create(pkgDir, output, pkgname, pkgver, pkgrel string, entries []footprint.Entry, backupLists ...[]string) error {
+	return CreateWithUSE(pkgDir, output, pkgname, pkgver, pkgrel, "", nil, nil, "", entries, backupLists...)
+}
+
+// CreateWithUSE creates an archive and records architecture and effective USE
+// metadata in .PKGINFO. The legacy Create function remains source-compatible.
+func CreateWithUSE(pkgDir, output, pkgname, pkgver, pkgrel, arch string, useFlags, useDisabled []string, useHash string, entries []footprint.Entry, backupLists ...[]string) error {
 	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil {
 		return fmt.Errorf("create package cache directory: %w", err)
 	}
@@ -65,6 +71,18 @@ func Create(pkgDir, output, pkgname, pkgver, pkgrel string, entries []footprint.
 	defer os.Remove(tarName)
 	tw := tar.NewWriter(tarFile)
 	metadata := fmt.Sprintf("pkgname = %s\npkgver = %s\npkgrel = %s\n", pkgname, pkgver, pkgrel)
+	if arch != "" {
+		metadata += fmt.Sprintf("arch = %s\n", arch)
+	}
+	if len(useFlags) > 0 {
+		metadata += fmt.Sprintf("use = %s\n", strings.Join(useFlags, " "))
+	}
+	if len(useDisabled) > 0 {
+		metadata += fmt.Sprintf("use_disabled = %s\n", strings.Join(useDisabled, " "))
+	}
+	if useHash != "" {
+		metadata += fmt.Sprintf("use_hash = %s\n", useHash)
+	}
 	if len(backupLists) > 0 {
 		for _, backup := range backupLists[0] {
 			metadata += fmt.Sprintf("backup = %s\n", backup)
@@ -278,11 +296,15 @@ func Entries(archivePath string) ([]footprint.Entry, error) {
 }
 
 type Info struct {
-	Pkgname string
-	Pkgver  string
-	Pkgrel  string
-	Backup  []string
-	Depends []string
+	Pkgname     string
+	Pkgver      string
+	Pkgrel      string
+	Backup      []string
+	Depends     []string
+	Arch        string
+	USEFlags    []string
+	USEDisabled []string
+	USEHash     string
 }
 
 // ReadInfo reads package identity fields from a .PKGINFO archive member.
@@ -338,6 +360,14 @@ func ReadInfo(archivePath string) (Info, error) {
 				info.Backup = append(info.Backup, strings.Trim(strings.TrimSpace(value), `"'`))
 			case "depends":
 				info.Depends = append(info.Depends, strings.Trim(strings.TrimSpace(value), `"'`))
+			case "arch":
+				info.Arch = strings.Trim(strings.TrimSpace(value), `"'`)
+			case "use", "use_flags", "use_tags":
+				info.USEFlags = append(info.USEFlags, strings.Fields(strings.Trim(strings.TrimSpace(value), `"'`))...)
+			case "use_disabled":
+				info.USEDisabled = append(info.USEDisabled, strings.Fields(strings.Trim(strings.TrimSpace(value), `"'`))...)
+			case "use_hash":
+				info.USEHash = strings.Trim(strings.TrimSpace(value), `"'`)
 			}
 		}
 		return info, nil
