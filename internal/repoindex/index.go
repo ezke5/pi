@@ -126,22 +126,29 @@ func Merge(index *Index, entries ...Entry) {
 		entry.normalizeUSE()
 		group := index.Packages[entry.Pkgname]
 		replaced := false
-		for i, old := range group.Versions {
+		filtered := make([]Entry, 0, len(group.Versions)+1)
+		for _, old := range group.Versions {
 			sameArch := old.Arch == entry.Arch || old.Arch == "" || entry.Arch == ""
 			old.normalizeUSE()
 			sameUSE := old.USEHash == entry.USEHash
-			if old.Pkgver == entry.Pkgver && old.Pkgrel == entry.Pkgrel && sameArch && sameUSE {
-				if entry.Arch == "" {
-					entry.Arch = old.Arch
+			sameVersion := old.Pkgver == entry.Pkgver && old.Pkgrel == entry.Pkgrel && sameArch && sameUSE
+			sameFile := old.Filename == entry.Filename
+			if sameVersion || sameFile {
+				if !replaced {
+					if entry.Arch == "" {
+						entry.Arch = old.Arch
+					}
+					filtered = append(filtered, entry)
+					replaced = true
 				}
-				group.Versions[i] = entry
-				replaced = true
-				break
+				continue
 			}
+			filtered = append(filtered, old)
 		}
 		if !replaced {
-			group.Versions = append(group.Versions, entry)
+			filtered = append(filtered, entry)
 		}
+		group.Versions = filtered
 		sort.Slice(group.Versions, func(i, j int) bool {
 			return CompareVersion(group.Versions[i].Pkgver, group.Versions[i].Pkgrel, group.Versions[j].Pkgver, group.Versions[j].Pkgrel) < 0
 		})
@@ -151,6 +158,37 @@ func Merge(index *Index, entries ...Entry) {
 		}
 		index.Packages[entry.Pkgname] = group
 	}
+}
+
+// Prune removes index entries whose archive Filename is not present in
+// existingFiles, updating Latest and deleting empty package groups.
+func Prune(index *Index, existingFiles map[string]bool) int {
+	if index == nil || index.Packages == nil {
+		return 0
+	}
+	removed := 0
+	for name, group := range index.Packages {
+		kept := make([]Entry, 0, len(group.Versions))
+		for _, entry := range group.Versions {
+			if existingFiles[entry.Filename] {
+				kept = append(kept, entry)
+			} else {
+				removed++
+			}
+		}
+		if len(kept) == 0 {
+			delete(index.Packages, name)
+			continue
+		}
+		sort.Slice(kept, func(i, j int) bool {
+			return CompareVersion(kept[i].Pkgver, kept[i].Pkgrel, kept[j].Pkgver, kept[j].Pkgrel) < 0
+		})
+		group.Versions = kept
+		latest := kept[len(kept)-1]
+		group.Latest = latest.Pkgver + "-" + latest.Pkgrel
+		index.Packages[name] = group
+	}
+	return removed
 }
 
 func Find(index Index, name, arch string) (Entry, bool) {

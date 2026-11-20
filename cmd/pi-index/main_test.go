@@ -138,3 +138,38 @@ func TestParseArchiveNamingConventions(t *testing.T) {
 		}
 	}
 }
+
+func TestRunIndexPruneRemovesDeletedArchives(t *testing.T) {
+	root := t.TempDir()
+	packages := filepath.Join(root, "packages")
+	if err := os.MkdirAll(packages, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p1 := filepath.Join(packages, "demo-1-1.pkg.tar.zst")
+	p2 := filepath.Join(packages, "demo-2-1.pkg.tar.zst")
+	if err := os.WriteFile(p1, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p2, []byte("v2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	indexPath := filepath.Join(root, "index.json")
+	var warnings bytes.Buffer
+	if err := runIndexWithOptions(indexPath, packages, "", "x86_64", false, &warnings); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(p2); err != nil {
+		t.Fatal(err)
+	}
+	if err := runIndexWithOptions(indexPath, packages, "", "x86_64", true, &warnings); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := repoindex.Load(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	group := idx.Packages["demo"]
+	if len(group.Versions) != 1 || group.Latest != "1-1" {
+		t.Fatalf("pruned index = %+v", group)
+	}
+}

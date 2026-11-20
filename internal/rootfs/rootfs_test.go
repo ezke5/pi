@@ -40,7 +40,7 @@ func TestBootstrapCreatesMinimalFHSSkeletonAndPreservesExistingEtc(t *testing.T)
 	if err := Bootstrap(root); err != nil {
 		t.Fatalf("Bootstrap failed: %v", err)
 	}
-	for _, rel := range []string{"usr/bin", "usr/lib", "usr/lib64", "etc", "dev", "proc", "sys", "tmp", "var"} {
+	for _, rel := range []string{"usr/bin", "usr/lib", "usr/lib64", "etc", "dev", "dev/pts", "dev/shm", "proc", "sys", "run", "root", "tmp", "var", "var/tmp"} {
 		info, err := os.Stat(filepath.Join(root, rel))
 		if err != nil || !info.IsDir() {
 			t.Fatalf("expected directory %s: info=%v err=%v", rel, info, err)
@@ -129,8 +129,8 @@ func TestChrootMountsAndUnmountsInReverseOrder(t *testing.T) {
 	if err := runner.Run(root, nil, nil, &out, &out); err != nil {
 		t.Fatalf("ChrootRunner.Run failed: %v", err)
 	}
-	wantMounts := []string{"dev", "dev/pts", "proc", "sys"}
-	wantUnmounts := []string{"sys", "proc", "dev/pts", "dev"}
+	wantMounts := []string{"dev", "dev/pts", "dev/shm", "proc", "sys"}
+	wantUnmounts := []string{"sys", "proc", "dev/shm", "dev/pts", "dev"}
 	if !reflect.DeepEqual(mounts, wantMounts) {
 		t.Fatalf("mounts = %v, want %v", mounts, wantMounts)
 	}
@@ -184,7 +184,7 @@ func TestChrootUnmountsOnMountErrorAndCommandError(t *testing.T) {
 		if execCalled {
 			t.Fatal("chroot command should not execute after mount failure")
 		}
-		wantUnmounts := []string{"dev/pts", "dev"}
+		wantUnmounts := []string{"dev/shm", "dev/pts", "dev"}
 		if !reflect.DeepEqual(unmounts, wantUnmounts) {
 			t.Fatalf("unmounts after partial mount = %v, want %v", unmounts, wantUnmounts)
 		}
@@ -212,7 +212,7 @@ func TestChrootUnmountsOnMountErrorAndCommandError(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "exit status 42") || !strings.Contains(err.Error(), "target busy") {
 			t.Fatalf("expected combined exec and unmount errors, got: %v", err)
 		}
-		wantUnmounts := []string{"sys", "proc", "dev/pts", "dev"}
+		wantUnmounts := []string{"sys", "proc", "dev/shm", "dev/pts", "dev"}
 		if !reflect.DeepEqual(unmounts, wantUnmounts) {
 			t.Fatalf("unmounts = %v, want %v", unmounts, wantUnmounts)
 		}
@@ -224,4 +224,80 @@ func TestChrootUnmountsOnMountErrorAndCommandError(t *testing.T) {
 			t.Fatal("expected host root chroot to be rejected")
 		}
 	})
+}
+
+func TestChrootSkipsAlreadyMountedAndOnlyUnmountsOwnMounts(t *testing.T) {
+	root := t.TempDir()
+	var mounted, unmounted []string
+	runner := ChrootRunner{
+		IsMounted: func(targetPath string) (bool, error) {
+			rel, _ := filepath.Rel(root, targetPath)
+			return filepath.ToSlash(rel) == "dev" || filepath.ToSlash(rel) == "proc", nil
+		},
+		Mount: func(spec MountSpec, targetPath string) error {
+			mounted = append(mounted, spec.Target)
+			return nil
+		},
+		Unmount: func(targetPath string) error {
+			rel, _ := filepath.Rel(root, targetPath)
+			unmounted = append(unmounted, filepath.ToSlash(rel))
+			return nil
+		},
+		Exec: func(r string, cmd []string, stdin io.Reader, stdout, stderr io.Writer) error {
+			return nil
+		},
+	}
+	if err := runner.Run(root, []string{"/bin/sh"}, nil, nil, nil); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if !reflect.DeepEqual(mounted, []string{"dev/pts", "dev/shm", "sys"}) {
+		t.Fatalf("mounted = %v, want [dev/pts dev/shm sys]", mounted)
+	}
+	if !reflect.DeepEqual(unmounted, []string{"sys", "dev/shm", "dev/pts"}) {
+		t.Fatalf("unmounted = %v, want [sys dev/shm dev/pts]", unmounted)
+	}
+}
+
+func TestChrootPreflightDetectsMissingELFInterpreter(t *testing.T) {
+	// Find a dynamically linked host ELF binary to stage into a temp rootfs.
+	hostBin := "/bin/sh"
+	interp, err := readELFInterp(hostBin)
+	if err != nil || interp == "" {
+		hostBin = "/bin/ls"
+		interp, err = readELFInterp(hostBin)
+	}
+	if err != nil || interp == "" {
+		t.Skip("no dynamically linked ELF binary available for preflight test")
+	}
+	binData, err := os.ReadFile(hostBin)
+	if err != nil {
+		t.Skip(err)
+	}
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "bin", "sh"), binData, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err = CheckChrootExecutable(root, "/bin/sh")
+	if err == nil || !strings.Contains(err.Error(), "requires missing ELF interpreter") || !strings.Contains(err.Error(), interp) {
+		t.Fatalf("expected missing ELF interpreter error for %q, got: %v", interp, err)
+	}
+
+	// Stage the interpreter inside root -> preflight should now pass.
+	interpPath, err := TargetPath(root, interp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(interpPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(interpPath, []byte("ld"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckChrootExecutable(root, "/bin/sh"); err != nil {
+		t.Fatalf("expected preflight to pass once interpreter is present, got: %v", err)
+	}
 }

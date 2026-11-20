@@ -8,10 +8,62 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/ezke5/pi/internal/footprint"
 	"github.com/ezke5/pi/internal/rootfs"
 )
+
+// DBLock holds an advisory flock on the target root's package database
+// directory (mirroring CRUX pkgutils db_lock).
+type DBLock struct {
+	dir *os.File
+}
+
+// Lock acquires a non-blocking shared or exclusive flock on var/lib/pi/packages.
+func Lock(root string, exclusive bool) (*DBLock, error) {
+	dirPath, err := RecordDir(root)
+	if err != nil {
+		return nil, err
+	}
+	if exclusive {
+		if err := os.MkdirAll(dirPath, 0o755); err != nil {
+			return nil, fmt.Errorf("create package metadata directory: %w", err)
+		}
+	} else if _, err := os.Stat(dirPath); os.IsNotExist(err) {
+		return &DBLock{}, nil
+	}
+	dir, err := os.Open(dirPath)
+	if err != nil {
+		return nil, fmt.Errorf("open package database directory %q: %w", dirPath, err)
+	}
+	mode := syscall.LOCK_SH
+	if exclusive {
+		mode = syscall.LOCK_EX
+	}
+	if err := syscall.Flock(int(dir.Fd()), mode|syscall.LOCK_NB); err != nil {
+		_ = dir.Close()
+		if err == syscall.EWOULDBLOCK || err == syscall.EAGAIN {
+			return nil, fmt.Errorf("package database %q is currently locked by another process", dirPath)
+		}
+		return nil, fmt.Errorf("lock package database %q: %w", dirPath, err)
+	}
+	return &DBLock{dir: dir}, nil
+}
+
+// Unlock releases the flock and closes the directory descriptor.
+func (l *DBLock) Unlock() error {
+	if l == nil || l.dir == nil {
+		return nil
+	}
+	err1 := syscall.Flock(int(l.dir.Fd()), syscall.LOCK_UN)
+	err2 := l.dir.Close()
+	l.dir = nil
+	if err1 != nil {
+		return err1
+	}
+	return err2
+}
 
 type Record struct {
 	Pkgname     string   `json:"pkgname"`
@@ -106,7 +158,14 @@ func Write(root string, record Record, entries []footprint.Entry) error {
 		tmp.Close()
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpName, meta); err != nil {
@@ -137,76 +196,194 @@ func OwnedByOthers(root, name string, path string) (bool, error) {
 	return false, nil
 }
 
+// VerifyResult captures structured verification results for an installed package.
+type VerifyResult struct {
+	OK     bool
+	Issues []string
+}
+
+// Reason returns a compact human-readable summary of verification failures.
+func (r VerifyResult) Reason() string {
+	if r.OK || len(r.Issues) == 0 {
+		return ""
+	}
+	return strings.Join(r.Issues, "; ")
+}
+
 // VerifyInstalled checks whether name is already installed in root at the exact
 // expected version-release and USE hash, and whether all recorded footprint
-// entries exist on disk without permission or integrity errors.
+// entries exist on disk without permission, symlink, or mode/ownership errors.
 func VerifyInstalled(root, name, expectedVer, expectedRel, expectedUSEHash string) (bool, string) {
-	if root == "" || name == "" || expectedVer == "" {
-		return false, "incomplete package identity"
+	res := VerifyPackage(root, name, expectedVer, expectedRel, expectedUSEHash)
+	return res.OK, res.Reason()
+}
+
+// VerifyPackage performs a full footprint and metadata integrity check for an
+// installed package. When expectedVer is empty, the package's recorded metadata
+// version is checked only for on-disk footprint integrity.
+func VerifyPackage(root, name, expectedVer, expectedRel, expectedUSEHash string) VerifyResult {
+	if root == "" || name == "" {
+		return VerifyResult{Issues: []string{"incomplete package identity"}}
 	}
-	record, err := Load(root, name)
+	rootAbs, err := filepath.Abs(root)
 	if err != nil {
-		return false, fmt.Sprintf("read metadata: %v", err)
+		return VerifyResult{Issues: []string{fmt.Sprintf("resolve root: %v", err)}}
+	}
+	record, err := Load(rootAbs, name)
+	if err != nil {
+		return VerifyResult{Issues: []string{fmt.Sprintf("read metadata: %v", err)}}
 	}
 	if record.Pkgver == "" {
-		return false, "not installed"
+		return VerifyResult{Issues: []string{"not installed"}}
 	}
-	if record.Pkgver != expectedVer || record.Pkgrel != expectedRel {
-		return false, fmt.Sprintf("installed version %s-%s differs from %s-%s", record.Pkgver, record.Pkgrel, expectedVer, expectedRel)
+	if expectedVer != "" && (record.Pkgver != expectedVer || record.Pkgrel != expectedRel) {
+		return VerifyResult{Issues: []string{fmt.Sprintf("installed version %s-%s differs from %s-%s", record.Pkgver, record.Pkgrel, expectedVer, expectedRel)}}
 	}
 	if expectedUSEHash != "" && record.USEHash != expectedUSEHash {
-		return false, fmt.Sprintf("USE hash changed (%q -> %q)", record.USEHash, expectedUSEHash)
+		return VerifyResult{Issues: []string{fmt.Sprintf("USE hash changed (%q -> %q)", record.USEHash, expectedUSEHash)}}
 	}
-	dir, err := RecordDir(root)
+	dir, err := RecordDir(rootAbs)
 	if err != nil {
-		return false, fmt.Sprintf("resolve metadata dir: %v", err)
+		return VerifyResult{Issues: []string{fmt.Sprintf("resolve metadata dir: %v", err)}}
 	}
 	footprintPath := filepath.Join(dir, name+".footprint")
 	if _, err := os.Stat(footprintPath); err != nil {
-		return false, fmt.Sprintf("missing footprint: %v", err)
+		return VerifyResult{Issues: []string{fmt.Sprintf("missing footprint: %v", err)}}
 	}
-	entries, err := Footprint(root, name)
+	entries, err := Footprint(rootAbs, name)
 	if err != nil {
-		return false, fmt.Sprintf("read footprint: %v", err)
+		return VerifyResult{Issues: []string{fmt.Sprintf("read footprint: %v", err)}}
 	}
+
+	backupSet := map[string]bool{}
+	for _, b := range record.Backup {
+		backupSet["/"+strings.TrimPrefix(filepath.ToSlash(b), "/")] = true
+	}
+	checkOwnership := os.Geteuid() == 0
+
+	var issues []string
 	for _, entry := range entries {
-		targetPath, err := rootfs.TargetPath(root, entry.Path)
+		targetPath, err := rootfs.TargetPath(rootAbs, entry.Path)
 		if err != nil {
-			return false, fmt.Sprintf("invalid footprint path %q: %v", entry.Path, err)
+			issues = append(issues, fmt.Sprintf("invalid footprint path %q: %v", entry.Path, err))
+			continue
 		}
 		info, err := os.Lstat(targetPath)
 		if err != nil {
-			return false, fmt.Sprintf("inspect installed path %q: %v", entry.Path, err)
+			issues = append(issues, fmt.Sprintf("missing or inaccessible %s: %v", entry.Path, err))
+			continue
 		}
+		isConfig := backupSet[entry.Path] || strings.HasPrefix(entry.Path, "/etc/")
 		switch entry.Type {
 		case "dir":
 			if !info.IsDir() {
-				return false, fmt.Sprintf("installed path %q is not a directory", entry.Path)
+				issues = append(issues, fmt.Sprintf("installed path %s is not a directory", entry.Path))
+				continue
+			}
+			if entry.Mode != 0 && !isConfig && info.Mode().Perm() != entry.Mode.Perm() {
+				issues = append(issues, fmt.Sprintf("mode drift on %s: got %04o, want %04o", entry.Path, info.Mode().Perm(), entry.Mode.Perm()))
+			}
+			if checkOwnership && !isConfig {
+				if issue := checkRootOwnership(entry.Path, info); issue != "" {
+					issues = append(issues, issue)
+				}
 			}
 		case "symlink":
 			if info.Mode()&os.ModeSymlink == 0 {
-				return false, fmt.Sprintf("installed path %q is not a symlink", entry.Path)
+				issues = append(issues, fmt.Sprintf("installed path %s is not a symlink", entry.Path))
+				continue
 			}
 			linkTarget, err := os.Readlink(targetPath)
 			if err != nil {
-				return false, fmt.Sprintf("read installed symlink %q: %v", entry.Path, err)
+				issues = append(issues, fmt.Sprintf("read installed symlink %s: %v", entry.Path, err))
+				continue
 			}
 			if entry.LinkTarget != "" && linkTarget != entry.LinkTarget {
-				return false, fmt.Sprintf("installed symlink %q target %q differs from %q", entry.Path, linkTarget, entry.LinkTarget)
+				issues = append(issues, fmt.Sprintf("symlink %s target %q differs from recorded %q", entry.Path, linkTarget, entry.LinkTarget))
+				continue
+			}
+			if err := resolveSymlinkInRoot(rootAbs, targetPath, entry.Path, linkTarget); err != nil {
+				issues = append(issues, err.Error())
 			}
 		default:
 			if !info.Mode().IsRegular() {
-				return false, fmt.Sprintf("installed path %q is not a regular file", entry.Path)
+				issues = append(issues, fmt.Sprintf("installed path %s is not a regular file", entry.Path))
+				continue
 			}
 			if info.Mode().Perm() == 0 {
-				return false, fmt.Sprintf("installed file %q has zero permissions", entry.Path)
+				issues = append(issues, fmt.Sprintf("installed file %s has zero permissions", entry.Path))
+				continue
 			}
 			f, err := os.Open(targetPath)
 			if err != nil {
-				return false, fmt.Sprintf("open installed file %q: %v", entry.Path, err)
+				issues = append(issues, fmt.Sprintf("unreadable installed file %s: %v", entry.Path, err))
+				continue
 			}
 			_ = f.Close()
+			if entry.Mode != 0 && !isConfig && info.Mode().Perm() != entry.Mode.Perm() {
+				issues = append(issues, fmt.Sprintf("mode drift on %s: got %04o, want %04o", entry.Path, info.Mode().Perm(), entry.Mode.Perm()))
+			}
+			if checkOwnership && !isConfig {
+				if issue := checkRootOwnership(entry.Path, info); issue != "" {
+					issues = append(issues, issue)
+				}
+			}
 		}
 	}
-	return true, ""
+	return VerifyResult{OK: len(issues) == 0, Issues: issues}
+}
+
+func checkRootOwnership(entryPath string, info os.FileInfo) string {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return ""
+	}
+	if st.Uid != 0 || st.Gid != 0 {
+		return fmt.Sprintf("ownership drift on %s: got %d:%d, want 0:0", entryPath, st.Uid, st.Gid)
+	}
+	return ""
+}
+
+const maxSymlinkDepth = 40
+
+func resolveSymlinkInRoot(rootAbs, linkAbs, displayPath, target string) error {
+	curLink := linkAbs
+	curTarget := target
+	for depth := 0; depth < maxSymlinkDepth; depth++ {
+		if filepath.IsAbs(curTarget) {
+			return fmt.Errorf("unsafe symlink %s -> %s: absolute symlink targets are not allowed", displayPath, curTarget)
+		}
+		resolved := filepath.Clean(filepath.Join(filepath.Dir(curLink), curTarget))
+		rel, err := filepath.Rel(rootAbs, resolved)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("unsafe symlink %s -> %s: target escapes root", displayPath, curTarget)
+		}
+		relSlash := filepath.ToSlash(rel)
+		if isVirtualRootfsPath(relSlash) {
+			return nil
+		}
+		info, err := os.Lstat(resolved)
+		if err != nil {
+			return fmt.Errorf("broken symlink %s -> %s (missing /%s)", displayPath, target, relSlash)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			return nil
+		}
+		nextTarget, err := os.Readlink(resolved)
+		if err != nil {
+			return fmt.Errorf("read symlink chain %s -> /%s: %v", displayPath, relSlash, err)
+		}
+		curLink = resolved
+		curTarget = nextTarget
+	}
+	return fmt.Errorf("broken symlink %s -> %s: symlink loop (depth > %d)", displayPath, target, maxSymlinkDepth)
+}
+
+func isVirtualRootfsPath(relSlash string) bool {
+	for _, prefix := range []string{"proc", "sys", "dev", "run"} {
+		if relSlash == prefix || strings.HasPrefix(relSlash, prefix+"/") {
+			return true
+		}
+	}
+	return false
 }
