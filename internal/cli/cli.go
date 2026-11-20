@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/ezke5/pi/internal/archive"
 	"github.com/ezke5/pi/internal/binary"
@@ -267,7 +266,7 @@ func cmdBuildRecipe(c config.Config, r pkgbuild.Recipe, reuse bool, stdout io.Wr
 	}
 
 	for i, source := range r.Source {
-		sourceResult, err := fetch.ResolveSource(source, filepath.Dir(r.Path), c.Cache, reuse, os.Stdin, stdout)
+		sourceResult, err := fetch.ResolveSourceWithTimeout(source, filepath.Dir(r.Path), c.Cache, reuse, c.DownloadTimeout, os.Stdin, stdout)
 		if err != nil {
 			return fmt.Errorf("%s", fetch.ManualDownloadNotice(fmt.Errorf("source %q for %s: %w", source, r.Pkgname, err)))
 		}
@@ -333,6 +332,10 @@ func cmdBuildRecipe(c config.Config, r pkgbuild.Recipe, reuse bool, stdout io.Wr
 	cmd.Stderr = stdout
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("execute build/package functions for %s: %w", r.Pkgname, err)
+	}
+
+	if err := archive.ValidateSymlinks(pkgDir); err != nil {
+		return fmt.Errorf("validate package %s: %w", r.Pkgname, err)
 	}
 
 	entries, err := footprint.Generate(pkgDir)
@@ -476,7 +479,7 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse,
 			tempPath := temp.Name()
 			temp.Close()
 			defer os.Remove(tempPath)
-			if downloadErr := fetch.Download(indexURL, tempPath, 30*time.Second); downloadErr == nil {
+			if downloadErr := fetch.Download(indexURL, tempPath, c.DownloadTimeout); downloadErr == nil {
 				if loaded, loadErr := binary.LoadIndex(tempPath); loadErr == nil {
 					index, indexLoaded = loaded, true
 				}
@@ -500,7 +503,7 @@ func cmdInstall(c config.Config, args []string, allowHost, force, dryRun, reuse,
 						archivePath, source = filepath.Join(c.Binpkgs, r.ArchiveName()), "build from PKGBUILD"
 						fmt.Fprintf(stdout, "binary unavailable in cache for %s; dry-run would fall back to PKGBUILD\n", r.Pkgname)
 					} else {
-						if resolvedPath, resolvedEntry, resolveErr := binary.ResolveForUSE(index, r.Pkgname, c.Arch, useState.Hash, c.Binpkgs, stdout); resolveErr == nil {
+						if resolvedPath, resolvedEntry, resolveErr := binary.ResolveForUSEWithTimeout(index, r.Pkgname, c.Arch, useState.Hash, c.Binpkgs, c.DownloadTimeout, stdout); resolveErr == nil {
 							archivePath, binaryEntry, source = resolvedPath, resolvedEntry, "repository binary"
 						} else {
 							archivePath, source = filepath.Join(c.Binpkgs, r.ArchiveName()), "build from PKGBUILD"

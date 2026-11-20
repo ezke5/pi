@@ -34,12 +34,10 @@ func safeSymlinkTarget(root, symlinkPath, target string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve destination root: %w", err)
 	}
-	var resolved string
 	if filepath.IsAbs(target) {
 		return "", fmt.Errorf("absolute symlink targets are not allowed")
-	} else {
-		resolved = filepath.Clean(filepath.Join(filepath.Dir(symlinkPath), target))
 	}
+	resolved := filepath.Clean(filepath.Join(filepath.Dir(symlinkPath), target))
 	rel, err := filepath.Rel(rootAbs, resolved)
 	if err != nil {
 		return "", fmt.Errorf("compare symlink target to destination root: %w", err)
@@ -47,10 +45,57 @@ func safeSymlinkTarget(root, symlinkPath, target string) (string, error) {
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("target escapes destination root")
 	}
-	if filepath.IsAbs(target) {
-		return strings.TrimPrefix(filepath.Clean(target), string(filepath.Separator)), nil
-	}
 	return target, nil
+}
+
+func suggestRelativeSymlinkTarget(rootAbs, symlinkAbs, target string) (string, bool) {
+	if !filepath.IsAbs(target) {
+		return "", false
+	}
+	clean := filepath.Clean(target)
+	inRoot := filepath.Join(rootAbs, strings.TrimPrefix(clean, string(filepath.Separator)))
+	rel, err := filepath.Rel(filepath.Dir(symlinkAbs), inRoot)
+	if err != nil {
+		return "", false
+	}
+	suggestion := filepath.ToSlash(rel)
+	if _, err := safeSymlinkTarget(rootAbs, symlinkAbs, suggestion); err != nil {
+		return "", false
+	}
+	return suggestion, true
+}
+
+// ValidateSymlinks validates every symlink in a package staging directory using
+// the exact same relative-symlink safety rules enforced during extraction.
+func ValidateSymlinks(pkgDir string) error {
+	rootAbs, err := filepath.Abs(pkgDir)
+	if err != nil {
+		return fmt.Errorf("resolve package staging root: %w", err)
+	}
+	return filepath.Walk(rootAbs, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return fmt.Errorf("inspect package staging path %q: %w", path, walkErr)
+		}
+		if path == rootAbs || info.Mode()&os.ModeSymlink == 0 {
+			return nil
+		}
+		rel, err := filepath.Rel(rootAbs, path)
+		if err != nil {
+			return fmt.Errorf("make package-relative path: %w", err)
+		}
+		name := strings.TrimPrefix(filepath.ToSlash(rel), "./")
+		target, err := os.Readlink(path)
+		if err != nil {
+			return fmt.Errorf("read symlink %q: %w", path, err)
+		}
+		if _, err := safeSymlinkTarget(rootAbs, path, target); err != nil {
+			if suggestion, ok := suggestRelativeSymlinkTarget(rootAbs, path, target); ok {
+				return fmt.Errorf("unsafe symlink target %q for %q: %w; use a relative target such as %q", target, name, err, suggestion)
+			}
+			return fmt.Errorf("unsafe symlink target %q for %q: %w; use a relative target within the package root", target, name, err)
+		}
+		return nil
+	})
 }
 
 func Create(pkgDir, output, pkgname, pkgver, pkgrel string, entries []footprint.Entry, backupLists ...[]string) error {
@@ -60,6 +105,9 @@ func Create(pkgDir, output, pkgname, pkgver, pkgrel string, entries []footprint.
 // CreateWithUSE creates an archive and records architecture and effective USE
 // metadata in .PKGINFO. The legacy Create function remains source-compatible.
 func CreateWithUSE(pkgDir, output, pkgname, pkgver, pkgrel, arch string, useFlags, useDisabled []string, useHash string, entries []footprint.Entry, backupLists ...[]string) error {
+	if err := ValidateSymlinks(pkgDir); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil {
 		return fmt.Errorf("create package cache directory: %w", err)
 	}

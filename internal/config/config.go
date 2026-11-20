@@ -10,38 +10,44 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
+const DefaultDownloadTimeout = 10 * time.Minute
+
 type Config struct {
-	Ports    string      `ini:"ports"`
-	Work     string      `ini:"work"`
-	Temp     string      `ini:"temp"`
-	Cache    string      `ini:"cache"`
-	Binpkgs  string      `ini:"binpkgs"`
-	Index    string      `ini:"index"`
-	RepoURL  string      `ini:"repo_url"`
-	Arch     string      `ini:"arch"`
-	Root     string      `ini:"root"`
-	Config   string      `ini:"-"`
-	Build    BuildConfig `ini:"-"`
-	Use      UseConfig   `ini:"-"`
-	Jobs     int         `ini:"-"`
-	CFLAGS   string      `ini:"-"`
-	CXXFLAGS string      `ini:"-"`
-	LDFLAGS  string      `ini:"-"`
-	STRIP    string      `ini:"-"`
+	Ports           string        `ini:"ports"`
+	Work            string        `ini:"work"`
+	Temp            string        `ini:"temp"`
+	Cache           string        `ini:"cache"`
+	Binpkgs         string        `ini:"binpkgs"`
+	Index           string        `ini:"index"`
+	RepoURL         string        `ini:"repo_url"`
+	Arch            string        `ini:"arch"`
+	Root            string        `ini:"root"`
+	DownloadTimeout time.Duration `ini:"download_timeout"`
+	Config          string        `ini:"-"`
+	Build           BuildConfig   `ini:"-"`
+	Use             UseConfig     `ini:"-"`
+	Jobs            int           `ini:"-"`
+	CFLAGS          string        `ini:"-"`
+	CXXFLAGS        string        `ini:"-"`
+	LDFLAGS         string        `ini:"-"`
+	STRIP           string        `ini:"-"`
 }
 
 type BuildConfig struct {
-	Jobs     int
-	CFlags   string
-	CFLAGS   string
-	CXXFlags string
-	CXXFLAGS string
-	LdFlags  string
-	LDFLAGS  string
-	Strip    string
+	Jobs            int
+	CFlags          string
+	CFLAGS          string
+	CXXFlags        string
+	CXXFLAGS        string
+	LdFlags         string
+	LDFLAGS         string
+	Strip           string
+	DownloadTimeout time.Duration
 }
 
 type UseConfig struct {
@@ -62,18 +68,22 @@ func Defaults() Config {
 	if err != nil {
 		home = "."
 	}
-	build := BuildConfig{Jobs: runtime.NumCPU(), CFlags: "", CFLAGS: "", CXXFlags: "", CXXFLAGS: "", LdFlags: "", LDFLAGS: "", Strip: "true"}
+	build := BuildConfig{
+		Jobs: runtime.NumCPU(), CFlags: "", CFLAGS: "", CXXFlags: "", CXXFLAGS: "", LdFlags: "", LDFLAGS: "", Strip: "true",
+		DownloadTimeout: DefaultDownloadTimeout,
+	}
 	use := UseConfig{PackageUse: map[string][]string{}}
 	c := Config{
-		Ports:   filepath.Join(".", "ports"),
-		Work:    filepath.Join(".", "work"),
-		Temp:    filepath.Join(".", "temp"),
-		Cache:   filepath.Join(home, ".pkg"),
-		Binpkgs: filepath.Join(home, ".pkg"),
-		Index:   filepath.Join(home, ".pkg", "index.json"),
-		Arch:    "x86_64",
-		Root:    "/",
-		Build:   build, Use: use,
+		Ports:           filepath.Join(".", "ports"),
+		Work:            filepath.Join(".", "work"),
+		Temp:            filepath.Join(".", "temp"),
+		Cache:           filepath.Join(home, ".pkg"),
+		Binpkgs:         filepath.Join(home, ".pkg"),
+		Index:           filepath.Join(home, ".pkg", "index.json"),
+		Arch:            "x86_64",
+		Root:            "/",
+		DownloadTimeout: DefaultDownloadTimeout,
+		Build:           build, Use: use,
 		Jobs: build.Jobs, CFLAGS: "", CXXFLAGS: "", LDFLAGS: "", STRIP: "true",
 	}
 	return c
@@ -131,6 +141,12 @@ func Load(path string) (Config, error) {
 				c.Build.LdFlags, c.Build.LDFLAGS, c.LDFLAGS = value, value, value
 			case "strip":
 				c.Build.Strip, c.STRIP = value, value
+			case "download_timeout", "download-timeout":
+				d, parseErr := parseDurationSetting(value)
+				if parseErr != nil {
+					return c, fmt.Errorf("parse config %q line %d (%s): %w", path, lineNo, key, parseErr)
+				}
+				c.Build.DownloadTimeout, c.DownloadTimeout = d, d
 			}
 			continue
 		}
@@ -165,6 +181,12 @@ func Load(path string) (Config, error) {
 			c.Arch = value
 		case "root", "target_root", "target-root":
 			c.Root = value
+		case "download_timeout", "download-timeout":
+			d, parseErr := parseDurationSetting(value)
+			if parseErr != nil {
+				return c, fmt.Errorf("parse config %q line %d (%s): %w", path, lineNo, key, parseErr)
+			}
+			c.DownloadTimeout, c.Build.DownloadTimeout = d, d
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -202,6 +224,32 @@ func (c *Config) syncBuildConvenience() {
 	c.CXXFLAGS = c.Build.CXXFLAGS
 	c.LDFLAGS = c.Build.LDFLAGS
 	c.STRIP = c.Build.Strip
+	if c.Build.DownloadTimeout > 0 {
+		c.DownloadTimeout = c.Build.DownloadTimeout
+	} else if c.DownloadTimeout > 0 {
+		c.Build.DownloadTimeout = c.DownloadTimeout
+	}
+}
+
+func parseDurationSetting(value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, fmt.Errorf("empty duration")
+	}
+	if secs, err := strconv.Atoi(value); err == nil {
+		if secs <= 0 {
+			return 0, fmt.Errorf("duration %q must be positive", value)
+		}
+		return time.Duration(secs) * time.Second, nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q (expected Go duration like 10m or integer seconds): %w", value, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("duration %q must be positive", value)
+	}
+	return d, nil
 }
 
 func (c *Config) loadPackageUse() error {
