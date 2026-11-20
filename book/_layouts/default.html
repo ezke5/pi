@@ -1,9 +1,9 @@
 <!doctype html>
-<!--
+{% comment %}
   _layouts/default.html — the page shell.
   A page picks this with `layout: default` in its front matter; Jekyll then drops the
-  page's own content in place of {{ content }}.
--->
+  page's own content into the Liquid content tag below.
+{% endcomment %}
 <html lang="{{ site.lang }}" data-theme="light">
 <head>
   {% include head.html %}
