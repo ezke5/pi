@@ -1,0 +1,146 @@
+/*
+  assets/css/main.css — the whole design in one small file.
+
+  Jekyll copies files in assets/ to _site/assets/ unchanged (no front matter = no
+  processing). Want Sass later? Put partials in _sass/ and give this file front matter.
+
+  Design rules: one serif face, ~65 characters per line, generous leading, three calm
+  colour themes, no web fonts, no animation beyond an optional gentle scroll.
+*/
+
+/* ---------- Themes: change colours by changing these variables only ---------- */
+:root {
+  --size: 19px;          /* base text size; A- / A+ buttons change it */
+  --measure: 36rem;      /* line length: about 65 characters at this size */
+  --bg: #fbfaf7;
+  --fg: #26231f;
+  --muted: #6d675e;
+  --rule: #e3dfd6;
+  --accent: #8a3b12;
+  --code-bg: #f2efe8;
+  --note-bg: #f4efe2;
+}
+[data-theme="sepia"] {
+  --bg: #f4ecd8; --fg: #3b3226; --muted: #7a6c55; --rule: #ddd0b4;
+  --accent: #8a4b14; --code-bg: #ebe0c6; --note-bg: #eadfc2;
+}
+[data-theme="dark"] {
+  --bg: #17181a; --fg: #dcd8d0; --muted: #98948b; --rule: #2c2e31;
+  --accent: #e0a46a; --code-bg: #212326; --note-bg: #23221f;
+}
+
+/* ---------- Base ---------- */
+* { box-sizing: border-box; }
+html { font-size: var(--size); -webkit-text-size-adjust: 100%; scroll-padding-top: 4.5rem; }
+@media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: Charter, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  line-height: 1.7;
+  text-rendering: optimizeLegibility;
+  font-kerning: normal;
+  hanging-punctuation: first;
+}
+a { color: var(--accent); text-underline-offset: 0.18em; }
+a:focus-visible, button:focus-visible, summary:focus-visible, main:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px;
+}
+main:focus { outline: none; }
+.skip { position: absolute; left: -999px; }
+.skip:focus { left: 1rem; top: 1rem; background: var(--bg); padding: .4rem .7rem; z-index: 20; }
+
+/* ---------- Top bar and progress line ---------- */
+.progress { position: fixed; inset: 0 0 auto 0; height: 3px; z-index: 11; }
+.progress span { display: block; height: 100%; width: 0; background: var(--accent); }
+.bar {
+  position: sticky; top: 0; z-index: 10;
+  display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+  padding: .55rem 1.25rem;
+  background: color-mix(in srgb, var(--bg) 92%, transparent);
+  border-bottom: 1px solid var(--rule);
+  font: 0.8rem/1.2 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+.brand { color: var(--fg); text-decoration: none; font-weight: 600; letter-spacing: .02em; }
+.controls { display: flex; gap: .4rem; }
+button {
+  font: inherit; color: var(--fg); background: transparent; cursor: pointer;
+  border: 1px solid var(--rule); border-radius: 4px; padding: .3rem .6rem;
+}
+button:hover { border-color: var(--muted); }
+
+/* ---------- Layout: one centred column; contents in the margin if there is room ---------- */
+main { max-width: var(--measure); margin: 0 auto; padding: 2.5rem 1.25rem 5rem; }
+.toc { font: 0.82rem/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+.toc ol { list-style: none; margin: 0; padding: 0; counter-reset: c; }
+.toc li { counter-increment: c; margin: .15rem 0; }
+.toc li a { display: block; padding: .2rem .5rem; color: var(--muted); text-decoration: none; border-left: 2px solid transparent; }
+.toc li a::before { content: counter(c) ". "; }
+.toc li a:hover { color: var(--fg); }
+.toc li a[aria-current="true"] { color: var(--fg); border-left-color: var(--accent); font-weight: 600; }
+.toc-title { margin: 0 0 .5rem; text-transform: uppercase; letter-spacing: .08em; font-size: .7rem; color: var(--muted); }
+.toc-top { margin: 0 0 2rem; padding: .6rem .9rem; border: 1px solid var(--rule); border-radius: 4px; }
+.toc-top summary { cursor: pointer; }
+.toc-top .toc-title { display: none; }
+.toc-side { display: none; }
+@media (min-width: 70rem) {
+  .toc-top { display: none; }
+  .toc-side {
+    display: block; position: fixed; top: 4rem; left: max(1rem, calc(50% - var(--measure) / 2 - 17rem));
+    width: 15rem; max-height: calc(100vh - 6rem); overflow: auto;
+  }
+}
+
+/* ---------- Intro and chapters ---------- */
+.kicker { margin: 0 0 .4rem; font: 600 .72rem/1 system-ui, sans-serif; text-transform: uppercase; letter-spacing: .12em; color: var(--muted); }
+.intro { padding: 3rem 0 2rem; }
+.intro h1 { font-size: 2.3rem; line-height: 1.15; margin: 0 0 1rem; font-weight: 600; }
+.lede { font-size: 1.15rem; color: var(--muted); margin: 0 0 1.5rem; }
+.start { font: 600 .9rem system-ui, sans-serif; }
+.hint { font: .78rem/1.5 system-ui, sans-serif; color: var(--muted); }
+.chapter { padding-top: 3.5rem; margin-top: 3.5rem; border-top: 1px solid var(--rule); }
+.chapter-head h2 { font-size: 1.75rem; line-height: 1.25; margin: 0 0 .5rem; font-weight: 600; }
+.summary { margin: 0 0 1.5rem; color: var(--muted); font-style: italic; }
+.chapter h3 { font-size: 1.15rem; margin: 2.2rem 0 .5rem; }
+p, ul, ol, pre, blockquote, table { margin: 0 0 1.1em; }
+li { margin: .25em 0; }
+.chapter p { hyphens: auto; }
+hr { border: 0; border-top: 1px solid var(--rule); margin: 2.5rem 0; }
+
+/* ---------- Code and notes ---------- */
+code, pre, kbd { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .84em; }
+code, kbd { background: var(--code-bg); padding: .1em .35em; border-radius: 3px; }
+pre {
+  background: var(--code-bg); padding: .9rem 1rem; border-radius: 4px; overflow-x: auto;
+  line-height: 1.55; tab-size: 2;
+}
+pre code { background: none; padding: 0; font-size: inherit; }
+blockquote { margin-left: 0; padding: .7rem 1rem; background: var(--note-bg); border-left: 3px solid var(--accent); border-radius: 0 4px 4px 0; }
+blockquote p:last-child { margin-bottom: 0; }
+/* Optional labels: write `{: .note}`, `{: .warn}` under a blockquote in Markdown. */
+blockquote.note::before, blockquote.warn::before {
+  display: block; font: 700 .68rem/1 system-ui, sans-serif; text-transform: uppercase;
+  letter-spacing: .12em; color: var(--accent); margin-bottom: .45rem;
+}
+blockquote.note::before { content: "Note"; }
+blockquote.warn::before { content: "Careful"; }
+table { border-collapse: collapse; width: 100%; font-size: .9em; }
+th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+
+/* ---------- Previous / next ---------- */
+.pager { display: flex; justify-content: space-between; gap: 1rem; margin-top: 3rem; font: .9rem/1.4 system-ui, sans-serif; }
+.pager a { display: block; max-width: 48%; padding: .7rem .9rem; border: 1px solid var(--rule); border-radius: 4px; color: var(--fg); text-decoration: none; }
+.pager a:hover { border-color: var(--accent); }
+.pager span { display: block; font-size: .7rem; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); margin-bottom: .15rem; }
+.pager .next { margin-left: auto; text-align: right; }
+
+.foot { text-align: center; padding: 2rem 1rem 3rem; font: .75rem/1.6 system-ui, sans-serif; color: var(--muted); border-top: 1px solid var(--rule); }
+.foot p { margin: 0; }
+
+@media (max-width: 40rem) { :root { --size: 18px; } .intro h1 { font-size: 1.9rem; } }
+@media print {
+  .bar, .progress, .toc, .pager, .foot { display: none !important; }
+  body { background: #fff; color: #000; }
+  .chapter { break-before: page; border: 0; }
+}

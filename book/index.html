@@ -1,0 +1,49 @@
+---
+# index.html — THE main reading hub.
+# The `---` block above is "front matter": it tells Jekyll "process this file".
+layout: default
+---
+{% comment %}
+  Everything below is Liquid. Jekyll evaluates it at build time and writes plain HTML.
+
+  1. Fetch the chapters from the _chapters/ collection and sort them by `order`.
+  2. Print each one as a <section>. `chapter.content` is the chapter's Markdown,
+     already converted to HTML by kramdown.
+  3. Add a previous/next pager to each chapter so reading flows like a book.
+{% endcomment %}
+{% assign chapters = site.chapters | sort: "order" %}
+
+<section class="intro" aria-labelledby="book-title">
+  <p class="kicker">A guide in {{ chapters.size }} chapters</p>
+  <h1 id="book-title">{{ site.title }}</h1>
+  <p class="lede">{{ site.tagline }}</p>
+  <p><a class="start" href="#{{ chapters.first.slug }}">Begin with chapter 1 &darr;</a></p>
+  <p class="hint">Read straight through, or jump from the contents. Your place, theme, and text size are remembered in this browser only.</p>
+</section>
+
+{% for chapter in chapters %}
+<section class="chapter" id="{{ chapter.slug }}" data-title="{{ chapter.title | escape }}">
+  <header class="chapter-head">
+    <p class="kicker">Chapter {{ chapter.order }}</p>
+    <h2>{{ chapter.title }}</h2>
+    {% if chapter.summary %}<p class="summary">{{ chapter.summary }}</p>{% endif %}
+  </header>
+
+  {{ chapter.content }}
+
+  <nav class="pager" aria-label="Chapter navigation">
+    {% unless forloop.first %}
+      {% assign prev_index = forloop.index0 | minus: 1 %}
+      {% assign prev = chapters[prev_index] %}
+      <a class="prev" rel="prev" href="#{{ prev.slug }}"><span>&larr; Previous</span>{{ prev.title }}</a>
+    {% endunless %}
+    {% unless forloop.last %}
+      {% assign next_index = forloop.index0 | plus: 1 %}
+      {% assign next = chapters[next_index] %}
+      <a class="next" rel="next" href="#{{ next.slug }}"><span>Next &rarr;</span>{{ next.title }}</a>
+    {% else %}
+      <a class="next" href="#book-title"><span>The end</span>Back to the top</a>
+    {% endunless %}
+  </nav>
+</section>
+{% endfor %}
