@@ -379,3 +379,80 @@ func TestRemoveBlocksReverseDependencyWithoutForce(t *testing.T) {
 		t.Fatalf("forced remove failed: %v", err)
 	}
 }
+
+func TestBuildRejectsAbsoluteSymlinkBeforePackaging(t *testing.T) {
+	root := t.TempDir()
+	ports := filepath.Join(root, "ports")
+	work := filepath.Join(root, "work")
+	cache := filepath.Join(root, "cache")
+	recipeDir := filepath.Join(ports, "bash")
+	for _, dir := range []string{recipeDir, work, cache} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recipe := `pkgname=bash
+pkgver=5.2.37
+pkgrel=1
+package() {
+  mkdir -p "$pkgdir/usr/bin" "$pkgdir/bin"
+  printf '#!/bin/sh\n' > "$pkgdir/usr/bin/bash"
+  chmod 755 "$pkgdir/usr/bin/bash"
+  ln -s /usr/bin/bash "$pkgdir/bin/bash"
+}
+`
+	if err := os.WriteFile(filepath.Join(recipeDir, "PKGBUILD"), []byte(recipe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	err := Run([]string{"--ports", ports, "--work", work, "--cache", cache, "build", "bash"}, &output, &output)
+	if err == nil {
+		t.Fatal("expected build to reject absolute symlink target")
+	}
+	for _, want := range []string{"absolute symlink targets are not allowed", "bin/bash", "/usr/bin/bash", "../usr/bin/bash"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("build error %q missing expected fragment %q", err.Error(), want)
+		}
+	}
+	archivePath := filepath.Join(cache, "bash-5.2.37-1.pkg.tar.zst")
+	if _, statErr := os.Stat(archivePath); !os.IsNotExist(statErr) {
+		t.Fatalf("package archive should not have been finalized: %v", statErr)
+	}
+}
+
+func TestBuildAcceptsRelativeSymlink(t *testing.T) {
+	if _, err := exec.LookPath("zstd"); err != nil {
+		t.Skip("zstd is required for package archive creation")
+	}
+	root := t.TempDir()
+	ports := filepath.Join(root, "ports")
+	work := filepath.Join(root, "work")
+	cache := filepath.Join(root, "cache")
+	recipeDir := filepath.Join(ports, "bash")
+	for _, dir := range []string{recipeDir, work, cache} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recipe := `pkgname=bash
+pkgver=5.2.37
+pkgrel=1
+package() {
+  mkdir -p "$pkgdir/usr/bin" "$pkgdir/bin"
+  printf '#!/bin/sh\n' > "$pkgdir/usr/bin/bash"
+  chmod 755 "$pkgdir/usr/bin/bash"
+  ln -s ../usr/bin/bash "$pkgdir/bin/bash"
+}
+`
+	if err := os.WriteFile(filepath.Join(recipeDir, "PKGBUILD"), []byte(recipe), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := Run([]string{"--ports", ports, "--work", work, "--cache", cache, "build", "bash"}, &output, &output); err != nil {
+		t.Fatalf("build with relative symlink failed: %v\n%s", err, output.String())
+	}
+	archivePath := filepath.Join(cache, "bash-5.2.37-1.pkg.tar.zst")
+	if _, err := os.Stat(archivePath); err != nil {
+		t.Fatalf("expected package archive %s to be created: %v", archivePath, err)
+	}
+}

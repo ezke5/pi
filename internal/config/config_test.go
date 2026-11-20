@@ -3,7 +3,9 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadAndCLIOverrides(t *testing.T) {
@@ -55,5 +57,45 @@ func TestUSEResolutionGlobalAndPackageOverride(t *testing.T) {
 	other := c.ResolveUSE("other")
 	if len(other.Enabled) != 2 || len(other.Disabled) != 1 {
 		t.Fatalf("unexpected global USE state: %+v", other)
+	}
+}
+
+func TestDownloadTimeoutConfiguration(t *testing.T) {
+	def := Defaults()
+	if def.DownloadTimeout != DefaultDownloadTimeout || def.Build.DownloadTimeout != DefaultDownloadTimeout {
+		t.Fatalf("unexpected default download timeout: config=%v build=%v", def.DownloadTimeout, def.Build.DownloadTimeout)
+	}
+
+	dir := t.TempDir()
+	piIni := filepath.Join(dir, "pi-section.ini")
+	if err := os.WriteFile(piIni, []byte("[pi]\ndownload_timeout = 7m\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(piIni)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.DownloadTimeout != 7*time.Minute || c.Build.DownloadTimeout != 7*time.Minute {
+		t.Fatalf("[pi] download_timeout not loaded: config=%v build=%v", c.DownloadTimeout, c.Build.DownloadTimeout)
+	}
+
+	buildIni := filepath.Join(dir, "build-section.ini")
+	if err := os.WriteFile(buildIni, []byte("[build]\njobs = 4\ndownload_timeout = 420\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err = Load(buildIni)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.DownloadTimeout != 420*time.Second || c.Build.DownloadTimeout != 420*time.Second || c.Build.Jobs != 4 {
+		t.Fatalf("[build] download_timeout not loaded: config=%v build=%v jobs=%d", c.DownloadTimeout, c.Build.DownloadTimeout, c.Build.Jobs)
+	}
+
+	badIni := filepath.Join(dir, "bad.ini")
+	if err := os.WriteFile(badIni, []byte("[build]\ndownload_timeout = not-a-duration\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(badIni); err == nil || !strings.Contains(err.Error(), "download_timeout") {
+		t.Fatalf("expected invalid download_timeout error, got: %v", err)
 	}
 }

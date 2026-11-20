@@ -26,6 +26,11 @@ func Resolve(index repoindex.Index, name, arch, cache string, out io.Writer) (st
 // ResolveForUSE resolves only a binary matching arch and effective USE hash.
 // An entry with no USE metadata is treated as a legacy, backward-compatible entry.
 func ResolveForUSE(index repoindex.Index, name, arch, useHash, cache string, out io.Writer) (string, repoindex.Entry, error) {
+	return ResolveForUSEWithTimeout(index, name, arch, useHash, cache, fetch.DefaultDownloadTimeout, out)
+}
+
+// ResolveForUSEWithTimeout behaves like ResolveForUSE with a configurable download timeout.
+func ResolveForUSEWithTimeout(index repoindex.Index, name, arch, useHash, cache string, timeout time.Duration, out io.Writer) (string, repoindex.Entry, error) {
 	entry, ok := repoindex.FindForUSE(index, name, arch, useHash)
 	if !ok {
 		return "", repoindex.Entry{}, fmt.Errorf("package %q is not present in repository index", name)
@@ -53,7 +58,10 @@ func ResolveForUSE(index repoindex.Index, name, arch, useHash, cache string, out
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return "", entry, fmt.Errorf("unsupported repository binary URL scheme %q for %q; only http and https are supported", parsed.Scheme, rawURL)
 	}
-	if err := fetch.Download(rawURL, path, 30*time.Second); err != nil {
+	if timeout <= 0 {
+		timeout = fetch.DefaultDownloadTimeout
+	}
+	if err := fetch.Download(rawURL, path, timeout); err != nil {
 		return "", entry, err
 	}
 	if err := VerifyUSE(path, entry, useHash); err != nil {

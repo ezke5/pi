@@ -4,8 +4,11 @@ package fetch
 import (
 	"bufio"
 	"crypto/sha256"
+	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -13,6 +16,23 @@ import (
 	"strings"
 	"time"
 )
+
+const (
+	// DefaultDownloadTimeout is the per-attempt overall download timeout used
+	// when no explicit timeout is supplied.
+	DefaultDownloadTimeout       = 10 * time.Minute
+	defaultDialTimeout           = 30 * time.Second
+	defaultTLSHandshakeTimeout   = 30 * time.Second
+	defaultResponseHeaderTimeout = 60 * time.Second
+	defaultMaxDownloadAttempts   = 3
+	defaultRetryBaseDelay        = 1 * time.Second
+)
+
+type downloadOptions struct {
+	timeout     time.Duration
+	maxAttempts int
+	baseDelay   time.Duration
+}
 
 type Result struct {
 	Path   string
@@ -23,6 +43,12 @@ type Result struct {
 // ResolveSource returns a local source path, downloading HTTP(S) sources into
 // cache when needed. Relative local sources are resolved from recipeDir.
 func ResolveSource(rawSource, recipeDir, cache string, reuse bool, in io.Reader, out io.Writer) (Result, error) {
+	return ResolveSourceWithTimeout(rawSource, recipeDir, cache, reuse, DefaultDownloadTimeout, in, out)
+}
+
+// ResolveSourceWithTimeout behaves like ResolveSource but uses timeout for
+// HTTP(S) downloads (defaulting to DefaultDownloadTimeout when timeout <= 0).
+func ResolveSourceWithTimeout(rawSource, recipeDir, cache string, reuse bool, timeout time.Duration, in io.Reader, out io.Writer) (Result, error) {
 	sourceName, rawURL := splitSourceName(rawSource)
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
@@ -78,7 +104,10 @@ func ResolveSource(rawSource, recipeDir, cache string, reuse bool, in io.Reader,
 	} else if statErr != nil && !os.IsNotExist(statErr) {
 		return Result{}, fmt.Errorf("inspect cached source %q: %w", local, statErr)
 	}
-	if err := Download(rawURL, local, 30*time.Second); err != nil {
+	if timeout <= 0 {
+		timeout = DefaultDownloadTimeout
+	}
+	if err := Download(rawURL, local, timeout); err != nil {
 		return Result{}, err
 	}
 	return Result{Path: local, Name: sourceName}, nil
@@ -119,6 +148,17 @@ func VerifySHA256(path, expected string) (bool, error) {
 }
 
 func Download(rawURL, dest string, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = DefaultDownloadTimeout
+	}
+	return downloadWithOptions(rawURL, dest, downloadOptions{
+		timeout:     timeout,
+		maxAttempts: defaultMaxDownloadAttempts,
+		baseDelay:   defaultRetryBaseDelay,
+	})
+}
+
+func downloadWithOptions(rawURL, dest string, opts downloadOptions) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("invalid source URL %q: %w", rawURL, err)
@@ -132,44 +172,149 @@ func Download(rawURL, dest string, timeout time.Duration) error {
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return fmt.Errorf("create download cache directory: %w", err)
 	}
-	client := &http.Client{Timeout: timeout}
+	if opts.timeout <= 0 {
+		opts.timeout = DefaultDownloadTimeout
+	}
+	if opts.maxAttempts <= 0 {
+		opts.maxAttempts = 1
+	}
+
+	transport := newDownloadTransport(opts.timeout)
+	defer transport.CloseIdleConnections()
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   opts.timeout,
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= opts.maxAttempts; attempt++ {
+		retryable, err := downloadOnce(client, rawURL, dest)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !retryable || attempt == opts.maxAttempts {
+			if attempt > 1 {
+				return fmt.Errorf("after %d attempts: %w", attempt, lastErr)
+			}
+			return lastErr
+		}
+		delay := opts.baseDelay << (attempt - 1)
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+	}
+	return lastErr
+}
+
+func newDownloadTransport(timeout time.Duration) *http.Transport {
+	var transport *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = base.Clone()
+	} else {
+		transport = &http.Transport{Proxy: http.ProxyFromEnvironment}
+	}
+	dialTimeout := minDuration(defaultDialTimeout, timeout)
+	tlsTimeout := minDuration(defaultTLSHandshakeTimeout, timeout)
+	headerTimeout := minDuration(defaultResponseHeaderTimeout, timeout)
+	transport.DialContext = (&net.Dialer{
+		Timeout:   dialTimeout,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	transport.TLSHandshakeTimeout = tlsTimeout
+	transport.ResponseHeaderTimeout = headerTimeout
+	return transport
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func downloadOnce(client *http.Client, rawURL, dest string) (bool, error) {
 	resp, err := client.Get(rawURL)
 	if err != nil {
-		var detail string
-		lower := strings.ToLower(err.Error())
-		switch {
-		case strings.Contains(lower, "tls") || strings.Contains(lower, "certificate") || strings.Contains(lower, "x509"):
-			detail = "TLS/certificate error"
-		case strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline"):
-			detail = "network timeout"
-		case strings.Contains(lower, "no such host") || strings.Contains(lower, "dns"):
-			detail = "DNS lookup failure"
-		default:
-			detail = "network request failure"
-		}
-		return fmt.Errorf("%s fetching %q: %w", detail, rawURL, err)
+		detail, retryable := classifyRequestError(err)
+		return retryable, fmt.Errorf("%s fetching %q: %w", detail, rawURL, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP status %s fetching %q", resp.Status, rawURL)
+		return isRetryableHTTPStatus(resp.StatusCode), fmt.Errorf("HTTP status %s fetching %q", resp.Status, rawURL)
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(dest), ".pi-download-*")
 	if err != nil {
-		return fmt.Errorf("create temporary download in %q: %w", filepath.Dir(dest), err)
+		return false, fmt.Errorf("create temporary download in %q: %w", filepath.Dir(dest), err)
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
-	if _, err := io.Copy(tmp, resp.Body); err != nil {
+	if readErr, writeErr := copyResponseBody(tmp, resp.Body); readErr != nil || writeErr != nil {
 		tmp.Close()
-		return fmt.Errorf("download %q: %w", rawURL, err)
+		if writeErr != nil {
+			return false, fmt.Errorf("write temporary download %q: %w", tmpName, writeErr)
+		}
+		return true, fmt.Errorf("download %q: %w", rawURL, readErr)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temporary download %q: %w", tmpName, err)
+		return false, fmt.Errorf("close temporary download %q: %w", tmpName, err)
 	}
 	if err := os.Rename(tmpName, dest); err != nil {
-		return fmt.Errorf("store downloaded source as %q: %w", dest, err)
+		return false, fmt.Errorf("store downloaded source as %q: %w", dest, err)
 	}
-	return nil
+	return false, nil
+}
+
+func classifyRequestError(err error) (detail string, retryable bool) {
+	var unknownAuth x509.UnknownAuthorityError
+	var certInvalid x509.CertificateInvalidError
+	var hostErr x509.HostnameError
+	if errors.As(err, &unknownAuth) || errors.As(err, &certInvalid) || errors.As(err, &hostErr) {
+		return "TLS/certificate error", false
+	}
+	lower := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline"):
+		return "network timeout", true
+	case strings.Contains(lower, "tls") || strings.Contains(lower, "certificate") || strings.Contains(lower, "x509"):
+		return "TLS/certificate error", false
+	case strings.Contains(lower, "no such host") || strings.Contains(lower, "dns"):
+		return "DNS lookup failure", true
+	default:
+		return "network request failure", true
+	}
+}
+
+func isRetryableHTTPStatus(code int) bool {
+	return code == http.StatusRequestTimeout ||
+		code == http.StatusTooManyRequests ||
+		(code >= http.StatusInternalServerError && code <= 599)
+}
+
+func copyResponseBody(dst io.Writer, src io.Reader) (readErr, writeErr error) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, rErr := src.Read(buf)
+		if n > 0 {
+			written := 0
+			for written < n {
+				nw, wErr := dst.Write(buf[written:n])
+				written += nw
+				if wErr != nil {
+					return nil, wErr
+				}
+				if nw == 0 {
+					return nil, io.ErrShortWrite
+				}
+			}
+		}
+		if rErr == io.EOF {
+			return nil, nil
+		}
+		if rErr != nil {
+			return rErr, nil
+		}
+	}
 }
 
 func ManualDownloadNotice(err error) string {

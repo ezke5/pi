@@ -69,3 +69,90 @@ func TestInvalidCompressionReportsActionableError(t *testing.T) {
 		t.Fatalf("unexpected compression error: %v", err)
 	}
 }
+
+func TestCreateRejectsAbsoluteSymlinkWithRelativeSuggestion(t *testing.T) {
+	root := t.TempDir()
+	pkgDir := filepath.Join(root, "pkg")
+	if err := os.MkdirAll(filepath.Join(pkgDir, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(pkgDir, "usr", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "usr", "bin", "bash"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/usr/bin/bash", filepath.Join(pkgDir, "bin", "bash")); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(root, "bash-5.2.37-1.pkg.tar.zst")
+	err := Create(pkgDir, output, "bash", "5.2.37", "1", nil)
+	if err == nil {
+		t.Fatal("expected absolute symlink to be rejected during archive creation")
+	}
+	for _, want := range []string{"absolute symlink targets are not allowed", "bin/bash", "/usr/bin/bash", "../usr/bin/bash"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing expected fragment %q", err.Error(), want)
+		}
+	}
+	if _, statErr := os.Stat(output); !os.IsNotExist(statErr) {
+		t.Fatalf("archive should not be created when symlink validation fails: %v", statErr)
+	}
+}
+
+func TestCreateRejectsEscapingRelativeSymlink(t *testing.T) {
+	root := t.TempDir()
+	pkgDir := filepath.Join(root, "pkg")
+	if err := os.MkdirAll(filepath.Join(pkgDir, "usr", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../../../outside", filepath.Join(pkgDir, "usr", "bin", "escape")); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(root, "escape-1-1.pkg.tar.zst")
+	err := Create(pkgDir, output, "escape", "1", "1", nil)
+	if err == nil || !strings.Contains(err.Error(), "target escapes destination root") {
+		t.Fatalf("expected escaping symlink error, got: %v", err)
+	}
+	if _, statErr := os.Stat(output); !os.IsNotExist(statErr) {
+		t.Fatalf("archive should not be created when symlink validation fails: %v", statErr)
+	}
+}
+
+func TestCreateAndExtractAllowsSafeRelativeSymlink(t *testing.T) {
+	if _, err := exec.LookPath("zstd"); err != nil {
+		t.Skip("zstd is required for package archive creation")
+	}
+	root := t.TempDir()
+	pkgDir := filepath.Join(root, "pkg")
+	if err := os.MkdirAll(filepath.Join(pkgDir, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(pkgDir, "usr", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkgDir, "usr", "bin", "bash"), []byte("bash"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../usr/bin/bash", filepath.Join(pkgDir, "bin", "bash")); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(root, "bash-5.2.37-1.pkg.tar.zst")
+	if err := Create(pkgDir, output, "bash", "5.2.37", "1", nil); err != nil {
+		t.Fatalf("expected relative symlink to be accepted: %v", err)
+	}
+	destRoot := filepath.Join(root, "extract")
+	if err := os.MkdirAll(destRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := Extract("", output, destRoot); err != nil {
+		t.Fatalf("extract relative symlink archive failed: %v", err)
+	}
+	got, err := os.Readlink(filepath.Join(destRoot, "bin", "bash"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "../usr/bin/bash" {
+		t.Fatalf("extracted symlink target = %q, want ../usr/bin/bash", got)
+	}
+}
