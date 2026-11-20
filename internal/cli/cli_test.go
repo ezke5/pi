@@ -591,80 +591,14 @@ package() {
 	}
 }
 
-func TestBootstrapSubcommandAndPreInstallSkeleton(t *testing.T) {
-	if _, err := exec.LookPath("zstd"); err != nil {
-		t.Skip("zstd is required for package archive creation")
-	}
-	root := t.TempDir()
-	bootstrapRoot := filepath.Join(root, "bootstrapped")
-
-	var output bytes.Buffer
-	if err := Run([]string{"--root", bootstrapRoot, "--dry-run", "bootstrap"}, &output, &output); err != nil {
-		t.Fatalf("dry-run bootstrap failed: %v", err)
-	}
-	if _, err := os.Stat(bootstrapRoot); !os.IsNotExist(err) {
-		t.Fatalf("dry-run bootstrap created target directory: %v", err)
-	}
-
-	output.Reset()
-	if err := Run([]string{"--root", bootstrapRoot, "bootstrap"}, &output, &output); err != nil {
-		t.Fatalf("bootstrap failed: %v", err)
-	}
-	for _, rel := range []string{"usr/bin", "usr/lib", "usr/lib64", "etc/passwd", "etc/group", "dev", "proc", "sys", "tmp", "var"} {
-		if _, err := os.Stat(filepath.Join(bootstrapRoot, rel)); err != nil {
-			t.Fatalf("missing bootstrapped path %s: %v", rel, err)
-		}
-	}
-
-	// Installing into an empty target root automatically creates the FHS skeleton.
-	installRoot := filepath.Join(root, "install-target")
-	pkgDir := filepath.Join(root, "pkg")
-	cache := filepath.Join(root, "cache")
-	if err := os.MkdirAll(filepath.Join(pkgDir, "usr", "bin"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(pkgDir, "usr", "bin", "hello"), []byte("hi"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	entries, err := footprint.Generate(pkgDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	archivePath := filepath.Join(cache, "hello-1-1.pkg.tar.zst")
-	if err := archive.Create(pkgDir, archivePath, "hello", "1", "1", entries); err != nil {
-		t.Fatal(err)
-	}
-	output.Reset()
-	if err := Run([]string{"--root", installRoot, "--cache", cache, "install", archivePath}, &output, &output); err != nil {
-		t.Fatalf("install into empty root failed: %v\n%s", err, output.String())
-	}
-	for _, rel := range []string{"usr/bin/hello", "usr/lib64", "etc/passwd", "etc/group", "proc", "sys"} {
-		if _, err := os.Stat(filepath.Join(installRoot, rel)); err != nil {
-			t.Fatalf("expected skeleton/installed path %s: %v", rel, err)
-		}
-	}
-}
-
-func TestChrootSubcommandDryRunAndFlagSplitting(t *testing.T) {
-	global, rest := splitFlags([]string{"--root", "/srv/crux", "chroot", "/bin/bash", "--noprofile", "--force"})
-	if strings.Join(global, " ") != "--root /srv/crux" {
-		t.Fatalf("chroot global flags = %v", global)
-	}
-	if strings.Join(rest, " ") != "chroot /bin/bash --noprofile --force" {
-		t.Fatalf("chroot rest args = %v", rest)
-	}
-
+func TestPiRejectsBootstrapAndChrootSubcommands(t *testing.T) {
 	target := t.TempDir()
-	var output bytes.Buffer
-	if err := Run([]string{"--root", target, "--dry-run", "chroot", "/bin/sh", "-c", "echo ok"}, &output, &output); err != nil {
-		t.Fatalf("dry-run chroot failed: %v", err)
-	}
-	if !strings.Contains(output.String(), "dry-run: chroot "+target+" (/bin/sh -c echo ok)") {
-		t.Fatalf("unexpected dry-run chroot output: %s", output.String())
-	}
-
-	if err := Run([]string{"--root", "/", "--allow-host-root", "chroot", "/bin/sh"}, &output, &output); err == nil {
-		t.Fatal("expected chroot into host root / to be rejected")
+	for _, sub := range []string{"bootstrap", "chroot"} {
+		var output bytes.Buffer
+		err := Run([]string{"--root", target, sub}, &output, &output)
+		if err == nil || !strings.Contains(err.Error(), "unknown subcommand") {
+			t.Fatalf("pi %s should be rejected after split to cmd/an, got err=%v output=%q", sub, err, output.String())
+		}
 	}
 }
 

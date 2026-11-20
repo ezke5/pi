@@ -20,7 +20,6 @@ import (
 	"github.com/ezke5/pi/internal/footprint"
 	"github.com/ezke5/pi/internal/pkgbuild"
 	"github.com/ezke5/pi/internal/repoindex"
-	"github.com/ezke5/pi/internal/rootfs"
 	"github.com/ezke5/pi/internal/state"
 )
 
@@ -93,10 +92,6 @@ func Run(args []string, stdout, stderr io.Writer) error {
 		return nil
 	case "init":
 		return cmdInit(c, *configPath, pos[1:], stdout)
-	case "bootstrap":
-		return cmdBootstrap(c, *allowHost, *dryRun, stdout)
-	case "chroot":
-		return cmdChroot(c, pos[1:], *dryRun, os.Stdin, stdout, stderr)
 	case "verify":
 		return cmdVerify(c, pos[1:], *allowHost, stdout)
 	case "info", "inspect":
@@ -126,26 +121,15 @@ func splitFlags(args []string) ([]string, []string) {
 	}
 	global := []string{}
 	rest := []string{}
-	seenChroot := false
-	inChrootCmd := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		if inChrootCmd {
-			rest = append(rest, arg)
-			continue
-		}
-		if arg == "--" {
-			inChrootCmd = true
-			rest = append(rest, arg)
-			continue
-		}
 		matched := false
 		for flagName := range valueFlags {
 			if arg == flagName || strings.HasPrefix(arg, flagName+"=") {
 				global = append(global, arg)
 				if arg == flagName && i+1 < len(args) {
 					next := args[i+1]
-					isSubcommand := next == "init" || next == "bootstrap" || next == "chroot" || next == "verify" || next == "info" || next == "inspect" || next == "build" || next == "install" || next == "remove" || next == "list" || next == "help"
+					isSubcommand := next == "init" || next == "verify" || next == "info" || next == "inspect" || next == "build" || next == "install" || next == "remove" || next == "list" || next == "help"
 					if !strings.HasPrefix(next, "--") && !isSubcommand {
 						i++
 						global = append(global, next)
@@ -166,11 +150,6 @@ func splitFlags(args []string) ([]string, []string) {
 		}
 		if !matched {
 			rest = append(rest, arg)
-			if arg == "chroot" && !seenChroot {
-				seenChroot = true
-			} else if seenChroot {
-				inChrootCmd = true
-			}
 		}
 	}
 	return global, rest
@@ -181,8 +160,6 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Commands:")
 	fmt.Fprintln(w, "  init [dir]                 Create recommended directory and config layout")
-	fmt.Fprintln(w, "  bootstrap                  Create minimal FHS skeleton in target root")
-	fmt.Fprintln(w, "  chroot [CMD...]            Mount virtual filesystems and chroot into target root")
 	fmt.Fprintln(w, "  verify [name...]           Verify installed package footprints, modes, and symlinks")
 	fmt.Fprintln(w, "  info|inspect <PKGBUILD>    Inspect a package recipe")
 	fmt.Fprintln(w, "  build <PKGBUILD|name>      Build and package a recipe")
@@ -196,7 +173,7 @@ func printUsage(w io.Writer) {
 }
 
 func cmdVerify(c config.Config, args []string, allowHost bool, stdout io.Writer) error {
-	target, err := rootfs.Validate(c.Root, allowHost)
+	target, err := validateTargetRoot(c.Root, allowHost)
 	if err != nil {
 		return err
 	}
@@ -238,41 +215,6 @@ func cmdVerify(c config.Config, args []string, allowHost bool, stdout io.Writer)
 		return fmt.Errorf("verification failed for %d package(s)", failed)
 	}
 	return nil
-}
-
-func cmdBootstrap(c config.Config, allowHost, dryRun bool, stdout io.Writer) error {
-	target, err := rootfs.Validate(c.Root, allowHost)
-	if err != nil {
-		return err
-	}
-	if dryRun {
-		fmt.Fprintf(stdout, "dry-run: bootstrap rootfs skeleton at %s\n", target)
-		return nil
-	}
-	if err := rootfs.Bootstrap(target); err != nil {
-		return err
-	}
-	fmt.Fprintf(stdout, "bootstrapped rootfs at %s\n", target)
-	return nil
-}
-
-func cmdChroot(c config.Config, args []string, dryRun bool, stdin io.Reader, stdout, stderr io.Writer) error {
-	target, err := rootfs.Validate(c.Root, false)
-	if err != nil {
-		return err
-	}
-	if len(args) > 0 && args[0] == "--" {
-		args = args[1:]
-	}
-	if dryRun {
-		cmd := args
-		if len(cmd) == 0 {
-			cmd = rootfs.DefaultChrootCommand(target)
-		}
-		fmt.Fprintf(stdout, "dry-run: chroot %s (%s)\n", target, strings.Join(cmd, " "))
-		return nil
-	}
-	return rootfs.Chroot(target, args, stdin, stdout, stderr)
 }
 
 func cmdInit(c config.Config, configPath string, args []string, stdout io.Writer) error {
@@ -536,7 +478,7 @@ func cmdInstall(c config.Config, args []string, allowHost, force, rebuild, keepW
 	if len(args) == 0 {
 		return fmt.Errorf("install requires a .pkg.tar.zst archive or package name")
 	}
-	target, err := rootfs.Validate(c.Root, allowHost)
+	target, err := validateTargetRoot(c.Root, allowHost)
 	if err != nil {
 		return err
 	}
@@ -848,9 +790,6 @@ func installArchive(c config.Config, target, archivePath string, record state.Re
 		fmt.Fprintf(stdout, "dry-run: install %s into %s\n", archivePath, target)
 		return nil
 	}
-	if _, err := rootfs.EnsureSkeletonIfEmpty(target); err != nil {
-		return err
-	}
 	lock, err := state.Lock(target, true)
 	if err != nil {
 		return err
@@ -879,7 +818,7 @@ func installArchive(c config.Config, target, archivePath string, record state.Re
 		if owned {
 			continue
 		}
-		path, err := rootfs.TargetPath(target, old.Path)
+		path, err := targetPath(target, old.Path)
 		if err != nil {
 			return err
 		}
@@ -899,7 +838,7 @@ func installArchive(c config.Config, target, archivePath string, record state.Re
 		if owned {
 			continue
 		}
-		path, err := rootfs.TargetPath(target, old.Path)
+		path, err := targetPath(target, old.Path)
 		if err == nil {
 			_ = os.Remove(path)
 		}
@@ -910,7 +849,7 @@ func installArchive(c config.Config, target, archivePath string, record state.Re
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.Path, "/lib/") || strings.HasPrefix(entry.Path, "/lib64/") ||
 			strings.HasPrefix(entry.Path, "/usr/lib/") || strings.HasPrefix(entry.Path, "/usr/lib64/") {
-			if err := rootfs.RunLDConfig(target); err != nil {
+			if err := runLDConfig(target); err != nil {
 				fmt.Fprintf(stdout, "warning: refresh dynamic linker cache: %v\n", err)
 			}
 			break
@@ -1054,7 +993,7 @@ func cmdRemove(c config.Config, args []string, allowHost, force, dryRun bool, st
 	if len(args) == 0 {
 		return fmt.Errorf("remove requires a package name")
 	}
-	target, err := rootfs.Validate(c.Root, allowHost)
+	target, err := validateTargetRoot(c.Root, allowHost)
 	if err != nil {
 		return err
 	}
@@ -1096,7 +1035,7 @@ func cmdRemove(c config.Config, args []string, allowHost, force, dryRun bool, st
 		return err
 	}
 	defer lock.Unlock()
-	recordDir, err := rootfs.TargetPath(target, "/var/lib/pi/packages")
+	recordDir, err := targetPath(target, "/var/lib/pi/packages")
 	if err != nil {
 		return err
 	}
@@ -1110,7 +1049,7 @@ func cmdRemove(c config.Config, args []string, allowHost, force, dryRun bool, st
 	}
 	for i := len(entries) - 1; i >= 0; i-- {
 		entry := entries[i]
-		path, err := rootfs.TargetPath(target, entry.Path)
+		path, err := targetPath(target, entry.Path)
 		if err != nil {
 			return err
 		}
@@ -1143,11 +1082,11 @@ func cmdRemove(c config.Config, args []string, allowHost, force, dryRun bool, st
 }
 
 func cmdList(c config.Config, allowHost bool, stdout io.Writer) error {
-	target, err := rootfs.Validate(c.Root, allowHost)
+	target, err := validateTargetRoot(c.Root, allowHost)
 	if err != nil {
 		return err
 	}
-	recordDir, err := rootfs.TargetPath(target, "/var/lib/pi/packages")
+	recordDir, err := targetPath(target, "/var/lib/pi/packages")
 	if err != nil {
 		return err
 	}
@@ -1162,6 +1101,85 @@ func cmdList(c config.Config, allowHost bool, stdout io.Writer) error {
 		if strings.HasSuffix(file.Name(), ".footprint") {
 			fmt.Fprintf(stdout, "%s\n", strings.TrimSuffix(file.Name(), ".footprint"))
 		}
+	}
+	return nil
+}
+
+func validateTargetRoot(root string, allowHostRoot bool) (string, error) {
+	if root == "" {
+		return "", fmt.Errorf("target root is empty")
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve target root %q: %w", root, err)
+	}
+	abs = filepath.Clean(abs)
+	if abs == "/" && !allowHostRoot {
+		return "", fmt.Errorf("refusing to use target root %q: this may modify the host filesystem; use --root=/path/to/target-root or --allow-host-root only with an intentional host operation", root)
+	}
+	if filepath.VolumeName(abs) != "" {
+		return "", fmt.Errorf("target root %q is not a POSIX-style path", root)
+	}
+	for _, part := range strings.Split(abs, string(filepath.Separator)) {
+		if part == ".." {
+			return "", fmt.Errorf("target root %q contains path traversal", root)
+		}
+	}
+	return abs, nil
+}
+
+func targetPath(root, name string) (string, error) {
+	if root == "" {
+		return "", fmt.Errorf("target root is empty")
+	}
+	if name == "" {
+		return "", fmt.Errorf("target path is empty")
+	}
+	for _, part := range strings.Split(filepath.ToSlash(name), "/") {
+		if part == ".." {
+			return "", fmt.Errorf("target path %q contains path traversal", name)
+		}
+	}
+	clean := filepath.Clean("/" + strings.TrimPrefix(name, "/"))
+	path := filepath.Join(root, clean)
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("target path %q escapes root %q", name, root)
+	}
+	return path, nil
+}
+
+func runLDConfig(root string) error {
+	confPath, err := targetPath(root, "/etc/ld.so.conf")
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(confPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	ldconfigBin, err := exec.LookPath("ldconfig")
+	if err != nil {
+		for _, candidate := range []string{"/sbin/ldconfig", "/usr/sbin/ldconfig"} {
+			if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
+				ldconfigBin = candidate
+				err = nil
+				break
+			}
+		}
+		if err != nil {
+			return nil
+		}
+	}
+	out, err := exec.Command(ldconfigBin, "-r", root).CombinedOutput()
+	if err != nil {
+		detail := strings.TrimSpace(string(out))
+		if detail != "" {
+			return fmt.Errorf("ldconfig -r %q: %w (%s)", root, err, detail)
+		}
+		return fmt.Errorf("ldconfig -r %q: %w", root, err)
 	}
 	return nil
 }
