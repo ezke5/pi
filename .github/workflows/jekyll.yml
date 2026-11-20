@@ -1,0 +1,87 @@
+# .github/workflows/jekyll.yml
+# Builds the Jekyll site in ./book and deploys it to GitHub Pages.
+#
+# One-time setup in your repository:
+#   Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
+#
+# Pull requests only BUILD and VERIFY (nothing is published).
+# Pushes to main also DEPLOY.
+name: Jekyll site
+
+on:
+  push:
+    branches: [main]
+    paths: ["book/**", ".github/workflows/jekyll.yml"]
+  pull_request:
+    paths: ["book/**", ".github/workflows/jekyll.yml"]
+  workflow_dispatch:
+
+# Least privilege: only what Pages deployment needs.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# A newer push cancels an older, still-running deployment.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: book
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs Ruby and runs `bundle install`. `bundler-cache: true` stores the
+      # gems keyed on Gemfile.lock, so later runs reuse them instead of downloading.
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: book
+
+      # Gives us the correct base path (e.g. /repo-name) for a project site.
+      - id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Build site
+        env:
+          JEKYLL_ENV: production
+        run: bundle exec jekyll build --baseurl "${{ steps.pages.outputs.base_path }}" --trace
+
+      # Clean-build verification: fail the run if the output is not what we expect.
+      - name: Verify build
+        run: |
+          set -eu
+          test -s _site/index.html
+          test -s _site/assets/css/main.css
+          test -s _site/assets/js/reader.js
+          expected=$(ls _chapters/*.md | wc -l)
+          actual=$(grep -c '<section class="chapter"' _site/index.html)
+          echo "chapters: expected=$expected rendered=$actual"
+          [ "$expected" -eq "$actual" ]
+          # Jekyll prints "Liquid error" / "Liquid Exception" into the page when a
+          # template is wrong. (Chapter 10 shows literal {{ }} examples on purpose,
+          # so we search for the error text, not for braces.)
+          if grep -nE 'Liquid (error|Exception|syntax error)' _site/index.html; then
+            echo "Liquid error found in output" >&2; exit 1
+          fi
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: book/_site
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

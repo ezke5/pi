@@ -1,0 +1,45 @@
+<!doctype html>
+<!--
+  _layouts/default.html — the page shell.
+  A page picks this with `layout: default` in its front matter; Jekyll then drops the
+  page's own content in place of {{ content }}.
+-->
+<html lang="{{ site.lang }}" data-theme="light">
+<head>
+  {% include head.html %}
+</head>
+<body>
+  <a class="skip" href="#book">Skip to the book</a>
+
+  <!-- Reading progress: a thin line; width is set by assets/js/reader.js -->
+  <div class="progress" aria-hidden="true"><span id="progress-bar"></span></div>
+
+  <header class="bar">
+    <a class="brand" href="{{ '/' | relative_url }}">{{ site.title }}</a>
+    <div class="controls" role="group" aria-label="Reading settings">
+      <button type="button" id="size-down" aria-label="Smaller text">A&minus;</button>
+      <button type="button" id="size-up" aria-label="Larger text">A+</button>
+      <button type="button" id="theme" aria-label="Change colour theme">Theme</button>
+    </div>
+  </header>
+
+  <!-- Wide screens: contents sit quietly in the left margin. -->
+  <aside class="toc toc-side">{% include toc.html %}</aside>
+
+  <main id="book" tabindex="-1">
+    <!-- Narrow screens: contents fold into a native <details> (no JS needed). -->
+    <details class="toc toc-top">
+      <summary>Contents</summary>
+      {% include toc.html %}
+    </details>
+
+    {{ content }}
+  </main>
+
+  <footer class="foot">
+    <p>Keys: <kbd>]</kbd> next chapter &middot; <kbd>[</kbd> previous &middot; <kbd>Space</kbd> page down &middot; <kbd>t</kbd> theme</p>
+  </footer>
+
+  <script src="{{ '/assets/js/reader.js' | relative_url }}" defer></script>
+</body>
+</html>

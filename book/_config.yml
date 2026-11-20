@@ -1,0 +1,55 @@
+# _config.yml — read ONCE when Jekyll starts. Restart `jekyll serve` after editing it.
+#
+# HOW JEKYLL WORKS (the 30-second version)
+#   1. READ    : walks this folder. Any file starting with "---" (front matter) is
+#                "processed"; everything else is copied verbatim. Folders/files that
+#                start with "_" or "." are NOT copied unless listed in `include`.
+#   2. RENDER  : Markdown -> HTML (kramdown), then Liquid templates ({% %}, {{ }})
+#                are filled in, then wrapped in a layout from _layouts/.
+#   3. WRITE   : the result lands in _site/ — plain static files, ready for any host.
+#
+# `jekyll serve` = build + tiny local web server + rebuild on every file change.
+
+title: The pi Handbook
+tagline: A quiet, step-by-step guide to building and installing packages with pi.
+description: A book-like reading hub for the pi package manager, the an rootfs tool, and pi-index.
+lang: en
+
+# --- URLs ---------------------------------------------------------------
+# Leave blank for local work. On GitHub Pages the workflow injects --baseurl
+# automatically (see .github/workflows/jekyll.yml), so you rarely edit these.
+url: ""
+baseurl: ""
+
+# --- Collections --------------------------------------------------------
+# A "collection" is a folder of content files named _<name>/. Ours is _chapters/.
+#   output: false  -> do NOT create a page per chapter. Instead, index.html loops
+#                     over site.chapters and prints them all on ONE reading page.
+collections:
+  chapters:
+    output: false
+
+# --- Markdown -----------------------------------------------------------
+markdown: kramdown
+kramdown:
+  # Zero-bloat: no syntax-highlighter spans or extra CSS. Code stays calm and mono.
+  syntax_highlighter_opts:
+    disable: true
+  # Stable heading ids (e.g. #the-three-tools) so section links never change.
+  auto_ids: true
+
+# --- Build hygiene ------------------------------------------------------
+# Files that must NOT be published.
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - README.md
+  - vendor
+  - node_modules
+  - .github
+
+# No plugins on purpose: it keeps builds identical locally and on GitHub Actions.
+plugins: []
+
+# Show a little less noise in the terminal.
+quiet: false

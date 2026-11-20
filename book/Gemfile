@@ -1,0 +1,10 @@
+# Gemfile — lists the Ruby libraries needed to build the site.
+# `bundle install` reads this; `bundle exec jekyll ...` then uses exactly these versions.
+source "https://rubygems.org"
+
+# Plain Jekyll (not the `github-pages` gem): the GitHub Actions workflow builds the
+# site itself, so we are free to use current Jekyll and are not tied to Pages' version.
+gem "jekyll", "~> 4.3"
+
+# Ruby 3+ no longer bundles a web server; `jekyll serve` needs this.
+gem "webrick", "~> 1.8"

@@ -1,0 +1,15 @@
+<!--
+  _includes/toc.html — the table of contents.
+  Built at BUILD time by looping over the chapters collection, so it works with
+  JavaScript turned off. JS only adds the "you are here" highlight.
+  `sort: "order"` uses the `order:` number in each chapter's front matter.
+-->
+{% assign toc_chapters = site.chapters | sort: "order" %}
+<nav aria-label="Table of contents">
+  <p class="toc-title">Contents</p>
+  <ol>
+    {% for c in toc_chapters %}
+    <li><a href="#{{ c.slug }}" data-chapter="{{ c.slug }}">{{ c.title }}</a></li>
+    {% endfor %}
+  </ol>
+</nav>
